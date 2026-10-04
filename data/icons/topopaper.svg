@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#2b3150"/>
+      <stop offset="1" stop-color="#1a1d2e"/>
+    </linearGradient>
+    <clipPath id="tile">
+      <rect x="8" y="8" width="112" height="112" rx="26"/>
+    </clipPath>
+  </defs>
+  <rect x="8" y="10" width="112" height="112" rx="26" fill="#000" opacity="0.18"/>
+  <rect x="8" y="8" width="112" height="112" rx="26" fill="url(#bg)"/>
+  <g clip-path="url(#tile)" fill="none" stroke-linejoin="round" stroke-linecap="round">
+    <!-- lake -->
+    <path d="M8 98 C 20 90, 34 92, 40 101 C 46 110, 40 122, 26 124 L 8 124 Z"
+          fill="#2f4a73" stroke="#7fa3cf" stroke-width="1.6"/>
+    <!-- contour rings around the summit -->
+    <g stroke-width="2.6">
+      <path stroke="#3d4566" d="M-6 70 C 4 34, 34 10, 72 10 C 112 10, 134 34, 132 62 C 130 92, 104 108, 76 106 C 56 104, 50 92, 30 92 C 12 92, -10 94, -6 70 Z"/>
+      <path stroke="#4a5378" d="M10 68 C 16 42, 40 22, 72 22 C 102 22, 120 40, 118 62 C 116 84, 98 96, 78 94 C 60 92, 54 82, 36 82 C 20 82, 6 84, 10 68 Z"/>
+      <path stroke="#5b658d" d="M24 66 C 28 48, 46 34, 70 34 C 94 34, 106 48, 104 64 C 102 80, 90 84, 76 82 C 62 80, 56 72, 42 72 C 30 72, 21 76, 24 66 Z"/>
+      <path stroke="#7280a8" d="M38 63 C 40 52, 52 45, 68 45 C 84 45, 92 54, 90 64 C 88 72, 80 73, 72 71 C 62 69, 58 64, 48 65 C 40 66, 36 69, 38 63 Z"/>
+      <path stroke="#9aa8d0" d="M54 60 C 55 55, 61 53, 68 53 C 75 53, 79 57, 78 61 C 77 64, 72 64, 66 62 C 60 61, 53 64, 54 60 Z"/>
+    </g>
+    <!-- a trail climbing to the summit -->
+    <path d="M98 122 C 94 108, 104 100, 96 90 C 88 80, 76 78, 72 66 C 70 61, 68 59, 67 58"
+          stroke="#f5a97f" stroke-width="2.8" stroke-dasharray="0.1 6"/>
+  </g>
+  <!-- summit -->
+  <circle cx="67" cy="58" r="3.4" fill="#f5a97f"/>
+  <rect x="8.75" y="8.75" width="110.5" height="110.5" rx="25.25" fill="none"
+        stroke="#ffffff" stroke-opacity="0.08" stroke-width="1.5"/>
+</svg>

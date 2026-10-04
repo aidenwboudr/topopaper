@@ -1,0 +1,77 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  checks:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq build-essential pkg-config libwayland-dev libegl-dev \
+            libgles-dev python3-numpy python3-pil python3-pytest shellcheck
+          pipx install ruff
+      - name: Build (warnings are errors)
+        run: make CFLAGS="-O2 -Werror"
+      - name: Unit tests
+        run: make check
+      - name: Lint
+        run: |
+          ruff check topopaper tests
+          shellcheck install.sh uninstall.sh bin/* tests/*.sh
+      - name: engine/themes.h matches topopaper/themes.py
+        run: python3 -m topopaper.themes | diff -u engine/themes.h -
+
+  install:
+    strategy:
+      fail-fast: false
+      matrix:
+        image: ["ubuntu:24.04", "debian:trixie", "fedora:latest", "archlinux:latest"]
+    runs-on: ubuntu-24.04
+    container: ${{ matrix.image }}
+    steps:
+      - name: Bootstrap
+        run: |
+          if command -v apt-get >/dev/null; then apt-get update -qq && apt-get install -y -qq git ca-certificates; fi
+          if command -v pacman >/dev/null; then pacman -Syu --noconfirm --needed git; fi
+          if command -v dnf >/dev/null; then dnf install -y -q git; fi
+      - uses: actions/checkout@v4
+      - name: install.sh
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: ./install.sh --yes --no-starter --no-autostart --no-launch
+      - name: Installed commands work
+        run: |
+          ~/.local/bin/topopaper-ctl status
+          ~/.local/bin/topopaper-ctl doctor --offline || true
+          test -x ~/.local/bin/topopaper
+      - name: uninstall.sh
+        run: ./uninstall.sh --purge && test ! -e ~/.local/bin/topopaper
+
+  render:
+    runs-on: ubuntu-24.04
+    container:
+      image: archlinux:latest
+      options: --cap-add SYS_NICE
+    steps:
+      - name: Dependencies
+        run: pacman -Syu --noconfirm --needed base-devel git pkgconf wayland mesa sway grim python python-numpy python-pillow
+      - uses: actions/checkout@v4
+      - name: Build
+        run: make
+      - name: Globe (starter download, else build it)
+        run: |
+          export TOPOPAPER_DATA=$PWD/ci-data
+          bin/topopaper-ctl starter || bin/topopaper-ctl build --earth
+      - name: Render under headless sway
+        run: tests/render-smoke.sh "$PWD/ci-data" "$PWD/ci-shots" earth
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: render-smoke
+          path: ci-shots/

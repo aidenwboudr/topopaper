@@ -1,0 +1,62 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.aidenwboudr.topopaper</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>GPL-3.0-or-later</project_license>
+  <name>Topopaper</name>
+  <summary>A live topographic map as your wallpaper</summary>
+  <developer id="io.github.aidenwboudr">
+    <name>The Topopaper contributors</name>
+  </developer>
+  <description>
+    <p>
+      Topopaper draws the world in contour lines on your Wayland desktop. The map
+      drifts and breathes, and flies between the places you care about — from the
+      whole globe down to a single ski lift.
+    </p>
+    <ul>
+      <li>Search for any place on Earth and a map of it is built from open data</li>
+      <li>Every map zooms smoothly out to the globe</li>
+      <li>A clock with the local weather, night-side city lights and aurora</li>
+      <li>Several colour themes; frame rate drops on battery and when windows cover it</li>
+    </ul>
+    <p>
+      Topopaper needs a compositor with the wlr-layer-shell protocol, such as sway,
+      Hyprland, niri, river, Wayfire or KDE Plasma. It does not run on GNOME Shell.
+    </p>
+  </description>
+  <launchable type="desktop-id">io.github.aidenwboudr.topopaper.desktop</launchable>
+  <url type="homepage">https://github.com/aidenwboudr/topopaper</url>
+  <url type="bugtracker">https://github.com/aidenwboudr/topopaper/issues</url>
+  <url type="vcs-browser">https://github.com/aidenwboudr/topopaper</url>
+  <categories>
+    <category>Settings</category>
+    <category>DesktopSettings</category>
+  </categories>
+  <keywords>
+    <keyword>wallpaper</keyword>
+    <keyword>map</keyword>
+    <keyword>topographic</keyword>
+    <keyword>contour</keyword>
+  </keywords>
+  <provides>
+    <binary>topopaper</binary>
+    <binary>topopaper-settings</binary>
+    <binary>topopaper-ctl</binary>
+  </provides>
+  <requires>
+    <display_length compare="ge">360</display_length>
+  </requires>
+  <supports>
+    <control>pointing</control>
+    <control>keyboard</control>
+  </supports>
+  <content_rating type="oars-1.1"/>
+  <releases>
+    <release version="1.0.0" date="2026-10-04">
+      <description>
+        <p>First release as an installable app, with a settings window and a first-run welcome.</p>
+      </description>
+    </release>
+  </releases>
+</component>

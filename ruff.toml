@@ -1,0 +1,6 @@
+line-length = 100
+[lint]
+select = ["E", "F", "W"]
+# one-line import lists and compact one-liners are the house style in the
+# pack builder; long lines are mostly data tables and comments
+ignore = ["E401", "E501", "E701", "E702", "E731", "E741"]

@@ -1,0 +1,16 @@
+# Build output
+/build/
+# Single-directory mode data (TOPOPAPER_DIR pointed at the checkout)
+/areas/
+/area
+/logs/
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+# Release artifacts
+/dist/
+*.tar.zst

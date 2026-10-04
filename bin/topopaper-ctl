@@ -1,0 +1,17 @@
+#!/bin/sh
+# Launcher for topopaper's Python side. Works from a source checkout
+# (bin/../topopaper) and from an install ($PREFIX/bin/../share/topopaper).
+# Interpreter: $TOPOPAPER_PYTHON, else the venv install.sh made, else python3.
+here=$(dirname "$(readlink -f "$0")")
+if [ -d "$here/../topopaper" ] && [ -f "$here/../Makefile" ]; then
+    root="$here/.."
+else
+    root="${TOPOPAPER_SHARE:-$here/../share/topopaper}"
+fi
+py="${TOPOPAPER_PYTHON:-}"
+if [ -z "$py" ]; then
+    venv="${TOPOPAPER_DATA:-${XDG_DATA_HOME:-$HOME/.local/share}/topopaper}/venv/bin/python"
+    if [ -x "$venv" ]; then py="$venv"; else py=python3; fi
+fi
+# PYTHONSAFEPATH: never import a stray topopaper/ from the current directory
+TOPOPAPER_BIN="$here" PYTHONSAFEPATH=1 PYTHONPATH="$root${PYTHONPATH:+:$PYTHONPATH}" exec "$py" -m "${TOPOPAPER_MODULE:-topopaper.cli}" "$@"

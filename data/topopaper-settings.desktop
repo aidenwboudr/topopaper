@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Topopaper
+GenericName=Wallpaper Settings
+Comment=A live topographic map as your wallpaper
+Exec=topopaper-settings
+Icon=io.github.aidenwboudr.topopaper
+Terminal=false
+Categories=Settings;DesktopSettings;
+Keywords=wallpaper;background;map;topographic;contour;atlas;
+StartupNotify=true
