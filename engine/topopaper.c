@@ -1571,7 +1571,8 @@ static const char *FRAG =
     "    float tot=w0v+w1v+w2v;\n"
     "    if(uDbg>0.5){\n"
     "      gl_FragColor=vec4(uDbg<1.5?vec3(w0v,w1v,w2v)/max(tot,1e-4)\n"
-    "                        :uDbg<2.5?c0:uDbg<3.5?c1:c2, 1.0);\n"
+    "                        :uDbg<2.5?c0:uDbg<3.5?c1:c2, 1.0);
+"
     "      return; }\n"
     "    vec3 terr=(tot>1e-4)?(c0*w0v+c1*w1v+c2*w2v)/tot:bg;\n"
     "    terr*=0.72+0.28*z;\n"          // limb darkening; ==1.0 up close
@@ -1625,7 +1626,7 @@ static const char *FRAG =
     "  col = mix(col, vec3(dot(col, vec3(0.333))), 0.30*nf);\n"
     "  col += aurC*aurA;\n"
     "  float vig = 1.0 - 0.28*pow(clamp(length(suv-vec2(0.5,0.42))/0.72,0.0,1.0),1.6);\n"
-    "  gl_FragColor = vec4(col*vig, 1.0);\n"
+    "  gl_FragColor = vec4(uDbg>0.5 ? vec3(0.0) : col*vig, 1.0);\n"
     "}\n";
 
 // ---- city-lights shaders (additive warm points on the globe's night side) --
@@ -1727,7 +1728,6 @@ void engine_gl_init(void) {
     u_ts2     = glGetUniformLocation(prog, "uTS2");
     u_ctr2    = glGetUniformLocation(prog, "uCtr2");
     u_fam     = glGetUniformLocation(prog, "uFam");
-    glUniform1i(glGetUniformLocation(prog, "uTer2"), UNIT_TER2);
     u_radpx   = glGetUniformLocation(prog, "uRadPx");
     u_dbg     = glGetUniformLocation(prog, "uDbg");
     u_globec  = glGetUniformLocation(prog, "uGlobeC");
@@ -1763,6 +1763,7 @@ void engine_gl_init(void) {
     glUniform1i(glGetUniformLocation(prog, "uFeat1"), UNIT_FEAT[1]);
     glUniform1i(glGetUniformLocation(prog, "uWat0"),  UNIT_WAT[0]);
     glUniform1i(glGetUniformLocation(prog, "uWat1"),  UNIT_WAT[1]);
+    glUniform1i(glGetUniformLocation(prog, "uTer2"),  UNIT_TER2);
     unsigned char flat[2] = {0, 0}, far2[2] = {255, 255}, dry[1] = {255};
     glGenTextures(1, &ph_ter_tex);
     glGenTextures(1, &ph_feat_tex);
