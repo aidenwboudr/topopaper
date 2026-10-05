@@ -297,9 +297,9 @@ def windows_session_cmd():
 
 def _run_key(value=None, delete=False):
     """Read (default), set or delete our value under HKCU\\...\\Run."""
-    import winreg
-    with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY, 0,
-                        winreg.KEY_READ | winreg.KEY_SET_VALUE) as k:
+    import winreg                           # a fresh profile may have no Run key yet
+    with winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, RUN_KEY, 0,
+                            winreg.KEY_READ | winreg.KEY_SET_VALUE) as k:
         if delete:
             try:
                 winreg.DeleteValue(k, "topopaper")
@@ -689,6 +689,8 @@ def keybind_add(keys=DEFAULT_KEYS):
         mods, key = parse_keys(keys)
         if comp == "windows":
             from . import hotkey
+            if keys == DEFAULT_KEYS:
+                keys = "Win+Shift+B"                 # what the key is called there
             hotkey.combo(keys)                       # ValueError for keys it can't register
             _hotkey_set(keys)
             return True, f"{keys} opens the place search while the wallpaper runs"

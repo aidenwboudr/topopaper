@@ -125,19 +125,6 @@ jobs:
           7z e mesa.7z -omesa x64/opengl32.dll x64/libgallium_wgl.dll -y | Out-Null
           Copy-Item mesa\*.dll "$env:LOCALAPPDATA\Programs\topopaper\bin\"
           "GALLIUM_DRIVER=llvmpipe" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
-      - name: Desktop probe
-        shell: pwsh
-        run: |
-          Add-Type @"
-          using System; using System.Runtime.InteropServices;
-          public static class U {
-            [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern IntPtr FindWindow(string c, string n);
-            [DllImport("user32.dll")] public static extern IntPtr GetWindowLongPtr(IntPtr h, int i);
-          }
-          "@
-          $pm = [U]::FindWindow("Progman", $null)
-          "explorer: " + ((Get-Process explorer -ErrorAction SilentlyContinue | Select-Object -First 1).SessionId)
-          "Progman: $pm  exstyle: 0x{0:x}" -f [int64][U]::GetWindowLongPtr($pm, -20)
       - name: Render a frame (TOPA_SHOT)
         shell: pwsh
         run: |
@@ -153,6 +140,7 @@ jobs:
         run: |
           $ctl = "$env:LOCALAPPDATA\Programs\topopaper\bin\topopaper-ctl.cmd"
           & $ctl restart
+          if ($LASTEXITCODE -ne 0) { throw "the session did not start" }
           Start-Sleep 20
           Add-Type -AssemblyName System.Windows.Forms, System.Drawing
           $b = [System.Windows.Forms.SystemInformation]::VirtualScreen
@@ -162,8 +150,10 @@ jobs:
           & $ctl status
           & $ctl doctor --offline
           & $ctl stop
-          Copy-Item "$env:LOCALAPPDATA\topopaper\state\logs\*.log" shots\ -ErrorAction SilentlyContinue
-          Get-Content shots\engine.log -ErrorAction SilentlyContinue | Select-Object -Last 15
+          if ($LASTEXITCODE -ne 0) { throw "the session did not stop" }
+          New-Item -ItemType Directory shots\session -Force | Out-Null
+          Copy-Item "$env:LOCALAPPDATA\topopaper\state\logs\*.log" shots\session\ -ErrorAction SilentlyContinue
+          Get-Content shots\session\session.log, shots\session\engine.log -ErrorAction SilentlyContinue
       - name: uninstall.ps1
         shell: powershell
         run: |
@@ -208,8 +198,9 @@ jobs:
           ~/.local/bin/topopaper-ctl status
           ~/.local/bin/topopaper-ctl doctor --offline || true
           ~/.local/bin/topopaper-ctl stop
-          cp ~/.local/state/topopaper/logs/*.log shots/ || true
-          tail -15 shots/engine.log || true
+          mkdir -p shots/session
+          cp ~/.local/state/topopaper/logs/*.log shots/session/ || true
+          cat shots/session/session.log shots/session/engine.log || true
       - name: uninstall.sh
         run: ./uninstall.sh --purge && test ! -e ~/.local/bin/topopaper
       - uses: actions/upload-artifact@v4

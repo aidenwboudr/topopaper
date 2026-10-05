@@ -146,7 +146,7 @@ missing() {
     if [ "$MACOS" = 1 ]; then
         xcode-select -p >/dev/null 2>&1 && command -v cc >/dev/null || m+=("Xcode command line tools")
         pick_python || m+=("Python 3.9+")
-        printf '%s\n' "${m[@]}"
+        printf '%s\n' ${m[@]+"${m[@]}"}
         return
     fi
     command -v cc >/dev/null || command -v gcc >/dev/null || m+=("C compiler")
@@ -167,7 +167,7 @@ EOF
     else
         m+=("Python 3 with PyGObject")
     fi
-    printf '%s\n' "${m[@]}"
+    printf '%s\n' ${m[@]+"${m[@]}"}
 }
 
 need="$(missing)"

@@ -60,10 +60,10 @@ def test_windows_keybind_is_a_setting(tmp_path, monkeypatch):
     monkeypatch.setenv("TOPOPAPER_CONFIG", str(tmp_path / "config.ini"))
     monkeypatch.setenv("TOPOPAPER_COMPOSITOR", "windows")
     assert not autostart.keybind_status()["enabled"]
-    ok, _ = autostart.keybind_add("Super+Shift+B")
-    assert ok and autostart.keybind_status()["line"] == "Super+Shift+B"
+    ok, msg = autostart.keybind_add()
+    assert ok and autostart.keybind_status()["line"] == "Win+Shift+B" and "Win+Shift+B" in msg
     ok, _ = autostart.keybind_add("Super+Shift+Pause")      # can't be registered
-    assert not ok and autostart.keybind_status()["line"] == "Super+Shift+B"
+    assert not ok and autostart.keybind_status()["line"] == "Win+Shift+B"
     assert autostart.keybind_remove()[0]
     assert not autostart.keybind_status()["enabled"]
 

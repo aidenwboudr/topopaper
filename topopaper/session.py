@@ -189,16 +189,18 @@ def open_log(name):
 
 
 def die_with(sig):
-    """Popen kwargs: on Linux the child gets `sig` if the session itself is
-    killed -9, so a crashed session never leaves an orphan engine drawing.
-    (Elsewhere the engine watches TOPOPAPER_PARENT itself.)"""
+    """Popen kwargs: on Linux the child gets signal `sig` (a name: Windows has
+    no SIGKILL) if the session itself is killed -9, so a crashed session never
+    leaves an orphan engine drawing. (Elsewhere the engine watches
+    TOPOPAPER_PARENT itself.)"""
     if not system.LINUX:
         return system.quiet()
+    num = getattr(signal, sig)
 
     def pre():
         try:
             import ctypes
-            ctypes.CDLL(None, use_errno=True).prctl(1, sig)     # PR_SET_PDEATHSIG
+            ctypes.CDLL(None, use_errno=True).prctl(1, num)     # PR_SET_PDEATHSIG
         except (OSError, AttributeError):
             pass
     return {"preexec_fn": pre}
@@ -267,7 +269,7 @@ class Session:
         try:
             self.engine = subprocess.Popen([self.engine_path], stdin=subprocess.DEVNULL,
                                            stdout=out, stderr=subprocess.STDOUT, env=env,
-                                           **die_with(signal.SIGKILL))
+                                           **die_with("SIGKILL"))
         except OSError as e:
             log.info("engine failed to start: %s", e)
             self.engine = None
@@ -323,7 +325,7 @@ class Session:
         try:
             self.watcher = subprocess.Popen(cmd, env=env, stdin=subprocess.DEVNULL,
                                             stdout=out, stderr=subprocess.STDOUT,
-                                            **die_with(signal.SIGTERM))
+                                            **die_with("SIGTERM"))
         finally:
             out.close()
         self.watch_started = now
@@ -505,6 +507,9 @@ def main(argv=None):
     ok = True
     try:
         ok = s.run()
+    except Exception:
+        log.exception("session crashed")    # under pythonw.exe there is no stderr
+        raise
     finally:
         s.shutdown()
         try:
