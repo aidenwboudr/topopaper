@@ -47,6 +47,9 @@ static HWND   ctl = NULL;           // hidden top-level window: broadcasts land 
 static HWND   parent = NULL;        // WorkerW or Progman; NULL in fallback mode
 static HWND   below_icons = NULL;   // 24H2: SHELLDLL_DefView, we go right under it
 static int    raised = 0;           // 24H2 layout
+static int    layered = 0;          // our windows are WS_EX_LAYERED
+// TOPA_WIN_ATTACH (diagnostics): progman (24H2 default), worker, worker-layered, top
+static const char *attach_mode = "";
 static UINT   msg_taskbar = 0;
 static int    rebuild = 1;
 static const wchar_t *VIEW_CLASS = L"topopaperView";
@@ -89,18 +92,40 @@ static int attach_desktop(void) {
         worker = find_worker(progman);
     }
     if (!worker) return 0;
-    if (raised) {
-        parent = progman;
-        below_icons = FindWindowExW(progman, NULL, L"SHELLDLL_DefView", NULL);
-    } else {
+    below_icons = raised ? FindWindowExW(progman, NULL, L"SHELLDLL_DefView", NULL) : NULL;
+    parent = raised ? progman : worker;
+    layered = raised;
+    if (!strncmp(attach_mode, "worker", 6)) {
         parent = worker;
+        layered = !strcmp(attach_mode, "worker-layered");
     }
     return 1;
 }
 
+// TOPA_WIN_DEBUG=1: the desktop's window tree, top of the z-order first
+static void dump_tree(HWND p, int depth) {
+    if (!getenv("TOPA_WIN_DEBUG") || depth > 2) return;
+    for (HWND h = GetWindow(p, GW_CHILD); h; h = GetWindow(h, GW_HWNDNEXT)) {
+        wchar_t cls[64] = L"";
+        char c8[64];
+        RECT r;
+        GetClassNameW(h, cls, 64);
+        GetWindowRect(h, &r);
+        WideCharToMultiByte(CP_UTF8, 0, cls, -1, c8, sizeof c8, NULL, NULL);
+        fprintf(stderr, "topopaper: %*s%s vis=%d ex=0x%lx (%ld,%ld %ldx%ld)\n", depth * 2, "", c8,
+                IsWindowVisible(h), (long)GetWindowLongPtrW(h, GWL_EXSTYLE),
+                r.left, r.top, r.right - r.left, r.bottom - r.top);
+        if (!wcscmp(cls, L"WorkerW") || !wcscmp(cls, L"SHELLDLL_DefView")) dump_tree(h, depth + 1);
+    }
+}
+
 // 24H2: the WorkerW (the plain wallpaper) must stay Progman's bottom child.
 static void keep_order(HWND hw) {
-    if (!raised) return;
+    if (!strcmp(attach_mode, "top")) {
+        SetWindowPos(hw, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        return;
+    }
+    if (parent != FindWindowW(L"Progman", NULL)) return;
     SetWindowPos(hw, below_icons ? below_icons : HWND_TOP, 0, 0, 0, 0,
                  SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
     if (worker && GetWindow(worker, GW_HWNDNEXT))
@@ -220,10 +245,10 @@ static void build_views(void) {
         if (desk) {
             // made as a popup, then turned into a child of the desktop layer:
             // layered (24H2) before SetParent, WS_CHILD set before it too
-            hw = CreateWindowExW(raised ? WS_EX_LAYERED : 0, VIEW_CLASS, L"topopaper",
+            hw = CreateWindowExW(layered ? WS_EX_LAYERED : 0, VIEW_CLASS, L"topopaper",
                                  WS_POPUP, 0, 0, v->w, v->h, NULL, NULL, inst, NULL);
             if (hw) {
-                if (raised) SetLayeredWindowAttributes(hw, 0, 255, LWA_ALPHA);
+                if (layered) SetLayeredWindowAttributes(hw, 0, 255, LWA_ALPHA);
                 SetWindowLongPtrW(hw, GWL_STYLE, WS_CHILD | WS_CLIPSIBLINGS | WS_CLIPCHILDREN);
                 if (!SetParent(hw, parent)) {
                     fprintf(stderr, "topopaper: SetParent failed (%lu); retrying\n", GetLastError());
@@ -262,9 +287,11 @@ static void build_views(void) {
             engine_gl_init();
         }
         ShowWindow(hw, SW_SHOWNOACTIVATE);
-        fprintf(stderr, "topopaper: drawing on %s (%dx%d%s)\n", v->name, v->w, v->h,
-                desk ? (raised ? ", desktop layer 24H2" : ", desktop layer") : ", bottom window");
+        fprintf(stderr, "topopaper: drawing on %s (%dx%d%s%s%s)\n", v->name, v->w, v->h,
+                desk ? (raised ? ", desktop layer 24H2" : ", desktop layer") : ", bottom window",
+                attach_mode[0] ? ", attach " : "", attach_mode);
     }
+    if (desk) dump_tree(FindWindowW(L"Progman", NULL), 0);
 }
 
 // ---- occlusion ----------------------------------------------------------------------
@@ -366,6 +393,7 @@ int main(void) {
     wc.lpszClassName = CTL_CLASS;
     RegisterClassW(&wc);
     msg_taskbar = RegisterWindowMessageW(L"TaskbarCreated");
+    if (getenv("TOPA_WIN_ATTACH")) attach_mode = getenv("TOPA_WIN_ATTACH");
     ctl = CreateWindowExW(WS_EX_TOOLWINDOW, CTL_CLASS, L"topopaper", WS_POPUP,
                           0, 0, 0, 0, NULL, NULL, inst, NULL);
     g_covered_src = 0;

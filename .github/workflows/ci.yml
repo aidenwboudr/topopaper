@@ -135,6 +135,26 @@ jobs:
           if (-not $p.WaitForExit(90000)) { $p.Kill(); throw "engine did not finish" }
           Get-Content shots\engine.log
           & "$env:LOCALAPPDATA\topopaper\venv\Scripts\python.exe" tests\ppm2png.py shots\earth.ppm shots\earth.png
+      - name: Desktop attach variants (diagnostics)
+        shell: pwsh
+        run: |
+          Add-Type -AssemblyName System.Windows.Forms, System.Drawing
+          $exe = "$env:LOCALAPPDATA\Programs\topopaper\bin\topopaper.exe"
+          $py = "$env:LOCALAPPDATA\topopaper\venv\Scripts\python.exe"
+          foreach ($m in "progman", "worker", "worker-layered", "top") {
+            $env:TOPA_WIN_ATTACH = $m; $env:TOPA_WIN_DEBUG = "1"
+            $p = Start-Process $exe -PassThru -RedirectStandardError "shots\attach-$m.log"
+            Start-Sleep 10
+            $b = [System.Windows.Forms.SystemInformation]::VirtualScreen
+            $bmp = New-Object System.Drawing.Bitmap $b.Width, $b.Height
+            [System.Drawing.Graphics]::FromImage($bmp).CopyFromScreen($b.Left, $b.Top, 0, 0, $bmp.Size)
+            $bmp.Save("$pwd\shots\attach-$m.png")
+            & $py -c "from topopaper import system; system.close_engine_windows()"
+            if (-not $p.WaitForExit(10000)) { $p.Kill() }
+            Start-Sleep 2
+            "== $m"; Get-Content "shots\attach-$m.log" | Select-String "drawing on|vis="
+          }
+          Remove-Item Env:TOPA_WIN_ATTACH, Env:TOPA_WIN_DEBUG
       - name: Session on the real desktop
         shell: pwsh
         run: |
