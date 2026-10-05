@@ -73,6 +73,17 @@ class MotionPage(Page):
         self._refreshers.append(self._roam_refresh)
         g.add(self.roam)
 
+        self.flight = SliderRow("Flight length",
+                                "How long a trip between maps takes; longer is slower "
+                                "and more cinematic",
+                                3.0, 45.0, 1.0,
+                                marks=((3.0, "Quick"), (20.0, None), (45.0, "Slow")),
+                                fmt=logic.flight_label)
+        self.flight.scale.connect("value-changed", self._flight_changed)
+        self._refreshers.append(
+            lambda: self.flight.scale.set_value(self.store.get("flight_seconds")))
+        g.add(self.flight)
+
         self.speed = SliderRow("Animation speed", "Drift, contour crawl and zoom breathing",
                                0.25, 2.0, 0.05,
                                marks=((0.25, None), (1.0, "Normal"), (2.0, None)),
@@ -107,6 +118,10 @@ class MotionPage(Page):
         if self._syncing or not (0 <= i < len(self._roam_vals)):
             return
         self.store.set("roam_minutes", f"{self._roam_vals[i]:g}")
+
+    def _flight_changed(self, scale):
+        if not self._syncing:
+            self.store.set("flight_seconds", f"{scale.get_value():.0f}", debounce=True)
 
     def _speed_changed(self, scale):
         if not self._syncing:

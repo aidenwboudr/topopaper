@@ -70,11 +70,16 @@ jobs:
           bin/topopaper-ctl starter || bin/topopaper-ctl build --earth
       - name: Render under headless sway
         run: tests/render-smoke.sh "$PWD/ci-data" "$PWD/ci-shots" earth
+      - name: Flight seams (synthetic packs, every frame of five flights)
+        run: tests/flight-check.sh "$PWD/ci-flights"
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: render-smoke
-          path: ci-shots/
+          path: |
+            ci-shots/
+            ci-flights/*.txt
+            ci-flights/*/f*.ppm
 
   # ---- Windows ---------------------------------------------------------------------
   windows-build:

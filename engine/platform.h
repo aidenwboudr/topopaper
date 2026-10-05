@@ -54,6 +54,8 @@
     X(PFNGLUNIFORM3FPROC, glUniform3f) \
     X(PFNGLUNIFORM3FVPROC, glUniform3fv) \
     X(PFNGLUNIFORM4FPROC, glUniform4f) \
+    X(PFNGLUNIFORM4FVPROC, glUniform4fv) \
+    X(PFNGLUNIFORMMATRIX4FVPROC, glUniformMatrix4fv) \
     X(PFNGLUSEPROGRAMPROC, glUseProgram) \
     X(PFNGLVERTEXATTRIBPOINTERPROC, glVertexAttribPointer)
 #  define TOPA_GL_DECL(type, name) extern type topa_##name;
@@ -83,6 +85,8 @@ TOPA_GL_FUNCS(TOPA_GL_DECL)
 #  define glUniform3f                topa_glUniform3f
 #  define glUniform3fv               topa_glUniform3fv
 #  define glUniform4f                topa_glUniform4f
+#  define glUniform4fv               topa_glUniform4fv
+#  define glUniformMatrix4fv         topa_glUniformMatrix4fv
 #  define glUseProgram               topa_glUseProgram
 #  define glVertexAttribPointer      topa_glVertexAttribPointer
 #elif defined(__APPLE__)

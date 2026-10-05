@@ -33,7 +33,16 @@ ruff check topopaper tests
 shellcheck install.sh uninstall.sh bin/topopaper-* tests/*.sh
 python3 -m topopaper.themes | diff engine/themes.h -   # after editing themes.py
 tests/render-smoke.sh DATA_DIR OUT_DIR [PACK]          # headless sway + screenshot
+tests/flight-check.sh OUT_DIR                          # flight seams, synthetic packs
 ```
+
+Flights are where seams show, so they have their own tools. `tests/flight-rec.sh
+DATA OUT START FLY` records every frame of a flight on a virtual 30 fps clock
+(`DBG=N` also dumps, every Nth frame, the map without labels, each shader
+slot's share and each slot rendered alone), and `tests/flight-seams.py OUT
+--data DATA` scores it: bare screen, frame-to-frame pops beyond the motion,
+how differently overlapping packs draw the same ground, and the colour step
+across each pack's edge. Run it on your own packs before changing the blend.
 
 CI runs all of these, plus `install.sh` on Arch, Debian, Ubuntu and Fedora
 containers, and builds, installs and renders on Windows and macOS runners.

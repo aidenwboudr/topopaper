@@ -25,22 +25,29 @@
 // (phase += speed*dt) and uniforms are smoothed with dt-scaled EMAs.
 //
 // A REGISTRY of every pack (metas scanned when the areas dir changes,
-// textures uploaded lazily, LRU-capped) is arranged on a LADDER by scale:
+// textures streamed in on demand, LRU-capped) is arranged on a LADDER by
+// scale:
 //
 //   * camera lives in normalized WEB-MERCATOR (x east, y south) — centre +
 //     view height. Idle = Ken-Burns breathing around the pack focus point.
 //   * each frame the ladder rungs covering the view are weighted by
 //     continuous laws of the camera state (sharpness yield, view overlap,
-//     territory between same-scale siblings — see step_world), and the top
-//     three fill the shader slots. Only packs whose bbox INTERSECTS THE VIEW
+//     territory between same-scale siblings — see ladder_weights), and the
+//     top three fill shader slots 0-2; slot 3 holds the finest pack covering
+//     the whole view during flights, so no part of the screen is ever bare.
+//     Every slot shades with one shared scale and the roads/lifts/borders
+//     composite as one layer, so overlapping packs hand over without
+//     showing their rectangles. Only packs whose bbox INTERSECTS THE VIEW
 //     are candidates — same-scale SIBLING packs elsewhere on the map (Tetons
 //     vs Wind Rivers) never blend in by height alone, and a cross-country
 //     flight naturally picks up each area it overflies. slot0 is always the
 //     DOMINANT pack.
 //   * fly-to (a new name in the area file) runs a van Wijk–Nuij path to the
-//     target's idle camera; a long dive naturally sweeps through every
-//     intermediate rung's imagery (rungs along the way preloaded at takeoff).
-//     Flights run at max(fps, 30); covered-freeze pauses them mid-air.
+//     target's live idle camera; a long dive naturally sweeps through every
+//     intermediate rung's imagery. The packs the path will draw on are
+//     predicted at takeoff and streamed in row strips between frames, so no
+//     frame stalls on an upload. Flights run at max(fps, 30); covered-freeze
+//     pauses them mid-air.
 //   * AUTO-ROAM: after a randomized stretch of atlas idle (mean roam_minutes,
 //     0 = off, battery stretches x1.6) the engine writes another pack's name
 //     into the area file itself — the ordinary watcher then flies there.
@@ -62,7 +69,8 @@
 // Debug env: TOPA_SUN_T=<epoch> pins the sun, TOPA_DEBUG=1 traces the camera
 // per frame, TOPA_NOHUD=1 drops the HUD, TOPA_POWER_DIR fakes the sysfs
 // power_supply tree, TOPA_SHOT=<file.ppm> saves the first display's frame
-// after TOPA_SHOT_T seconds (default 8) and exits.
+// after TOPA_SHOT_T seconds (default 8) and exits, TOPA_REC=<dir> records
+// flights frame by frame (see g_rec; tests/flight-rec.sh drives it).
 #include "platform.h"
 #include "themes.h"
 #include <stdio.h>
@@ -101,13 +109,19 @@ struct pack {
     float  elev_lo, elev_hi, step;
     float  focus_u, focus_v;
     float  stL[6], stA[6];          // r,g,b, w0px,w1px, opacity
-    GLuint ter_tex, feat_tex, atlas_tex, water_tex;
+    GLuint ter_tex, fw_tex, atlas_tex;   // fw: features rg + water b
     int    ter_w, ter_h, atlas_w, atlas_h;
     int    n_lab;
     float  lab_u[PKMAX], lab_v[PKMAX], lab_hmin[PKMAX], lab_hmax[PKMAX];
     int    lab_ax[PKMAX], lab_ay[PKMAX];
     int    lab_rx[PKMAX], lab_ry[PKMAX], lab_rw[PKMAX], lab_rh[PKMAX];
     float  lab_vis[PKMAX];          // eased declutter gate (label authority)
+    // streaming upload (pack_stream): stage 0 idle, 1 terrain rows,
+    // 2 features+water rows, 3 labels; files stay open between frames
+    int    up_stage, up_row, fw_w, fw_h, wat_w, wat_h;
+    float  fade;                    // eases 0 -> 1 once resident (weights x fade)
+    FILE  *up_ft, *up_ff, *up_fwat;
+    unsigned char *up_wall;         // whole water.bin when its size differs
     char   tzname[40];              // IANA tz baked in meta.bin (optional tail)
     int    tz_min; long tz_when;    // cached utc-offset minutes + stamp
 };
@@ -116,20 +130,26 @@ static int n_packs = 0;
 static int lad[MAXPACKS];           // pack indices sorted by msy ASC (fine->coarse)
 static int n_lad = 0;
 static int p_cur = -1;              // home pack: idle camera + roam source
-static int s_slotpk[3] = {-1, -1, -1};  // shader slots: 0/1 full, 2 = guarantor
-static float g_lf0 = 1.0f, g_lf1 = 1.0f; // label factors: territory share (sibling law)
-static double sv_cx[2], sv_cy[2], sv_hx[2], sv_hy[2];   // slot view transforms
-static const int UNIT_TER[2]  = {0, 3};
-static const int UNIT_FEAT[2] = {2, 4};
-static const int UNIT_WAT[2]  = {5, 6};
-static const int UNIT_TER2    = 7;      // guarantor slot: terrain-only
-static GLuint ph_ter_tex = 0, ph_feat_tex = 0, ph_wat_tex = 0;   // 1x1 placeholders
+// shader slots: 0-2 the top of the weight law, 3 the coverage container
+static int s_slotpk[4] = {-1, -1, -1, -1};
+static float g_lf[3] = {1.0f, 1.0f, 1.0f}; // label factors: territory share (sibling law)
+static double sv_cx[4], sv_cy[4], sv_hx[4], sv_hy[4];   // slot view transforms
+// four slots in the eight units GLES2 guarantees (the label/HUD passes
+// rebind unit 1 for their atlases; every frame rebinds the slots)
+static const int UNIT_TER[4] = {0, 3, 6, 7};
+static const int UNIT_FW[4]  = {2, 4, 5, 1};
+static GLuint ph_ter_tex = 0, ph_fw_tex = 0;    // 1x1 placeholders
 
 // ---- GL program ------------------------------------------------------------
 static GLuint prog, vbo;
 static GLint a_pos;
 static GLint u_res, u_crawlm, u_cpu, u_night, u_w;
-static GLint u_texel2, u_tc2, u_ts2, u_ctr2, u_fam;
+static GLint u_fam;
+static GLint u_dbg = -1, u_hs = -1, u_fg = -1, u_fin = -1, u_sib = -1;
+static float g_fg[4] = {1.0f, 0.0f, 0.0f, 0.0f};   // feature gates per slot
+static float g_fin[16];                             // [i*4+j]: slot j finer than i
+static float g_sib[16];                             // [i*4+j]: slots i, j share a scale
+static GLint  u_fe[4] = {-1, -1, -1, -1};
 static GLint u_radpx, u_globec, u_wrap, u_sun, u_sunh, u_snow, u_aur;
 // city lights (lights.bin: world cities for the globe's night side)
 #define MAXLTS 8192
@@ -137,8 +157,8 @@ static float  lt_lat[MAXLTS], lt_lon[MAXLTS], lt_w[MAXLTS];
 static int    g_lts_n = 0;
 static GLuint ltprog = 0;
 static GLint  lta_pos = -1, ltu_pts = -1;
-static GLint u_texel[2], u_tc[2], u_ts[2], u_ctr[2];
-static GLint u_fcl[2], u_fpl[2], u_fca[2], u_fpa[2];
+static GLint u_texel[4], u_tc[4], u_ts[4], u_ctr[4];
+static GLint u_fcl[4], u_fpl[4], u_fca[4], u_fpa[4];
 static GLuint lprog;
 static GLint la_pos, lu_rect, lu_uv, lu_alpha;
 // theme palette uniforms (main, label and city-light programs)
@@ -228,7 +248,7 @@ static double f_c0x, f_c0y, f_w0, f_c1x, f_c1y, f_w1;
 static double f_r0 = 0.0, f_S = 1.0, f_d = 0.0, f_ux = 0.0, f_uy = 0.0;
 static int    f_pure = 0;                   // degenerate pure-zoom path
 static double land_t = 0.0, land_x, land_y, land_h;
-static float  g_w0v = 1.0f, g_w1v = 0.0f, g_w2v = 0.0f;   // slot weights
+static float  g_w0v = 1.0f, g_w1v = 0.0f, g_w2v = 0.0f, g_w3v = 0.0f; // slot weights
 #define FRACTAL_BASE 30.0   // contour family anchor (12: 60m packs exact; 30: ski-site packs exact)
 static double g_step_cont = 60.0;           // continuous contour step (m)
 static double g_fam_s = 60.0, g_fam_t = 0.0;// 5^k family base + band phase
@@ -249,7 +269,7 @@ static double roam_mean_min = 8.0;          // config roam_minutes; <=0 disables
 // consumers that need to react once (shader palette, output set, ...).
 static struct {
     char   home_area[64];
-    double roam_minutes, animation_speed;
+    double roam_minutes, animation_speed, flight_seconds;
     char   theme[32];
     int    city_lights, aurora, labels, react_to_cpu;
     int    show_clock, clock_24h, show_weather, show_news;
@@ -266,7 +286,7 @@ static char   cache_dir[400];
 static void cfg_defaults(void) {
     memset(&cfg, 0, sizeof cfg);
     snprintf(cfg.home_area, sizeof cfg.home_area, "earth");
-    cfg.roam_minutes = 8.0; cfg.animation_speed = 1.0;
+    cfg.roam_minutes = 8.0; cfg.animation_speed = 1.0; cfg.flight_seconds = 20.0;
     snprintf(cfg.theme, sizeof cfg.theme, "macchiato");
     cfg.city_lights = cfg.aurora = cfg.labels = cfg.react_to_cpu = 1;
     cfg.show_clock = cfg.show_weather = cfg.show_news = 1;
@@ -295,6 +315,11 @@ static void cfg_set(const char *k, const char *v) {
 #undef STR
 #undef BOOL
     if (!strcmp(k, "roam_minutes")) { cfg.roam_minutes = atof(v); return; }
+    if (!strcmp(k, "flight_seconds")) {
+        double a = atof(v);
+        cfg.flight_seconds = a < 2.0 ? 2.0 : a > 120.0 ? 120.0 : a;
+        return;
+    }
     if (!strcmp(k, "animation_speed")) {
         double a = atof(v);
         cfg.animation_speed = a < 0.0 ? 0.0 : a > 4.0 ? 4.0 : a;
@@ -363,7 +388,22 @@ static void cfg_poll(int force) {
     }
 }
 
-static double now_sec(void) { return mono_sec() - t_start; }
+// TOPA_REC=<dir>: flight recorder for seam hunting (tests/flight-rec.sh). A
+// virtual clock advances exactly 1/TOPA_REC_FPS (default 30) per frame however
+// slow the renderer, every frame of the primary display lands in <dir> as
+// fNNNNN.ppm with a matching camera/weights line in <dir>/trace.txt, and
+// TOPA_REC_FLY=a,b,... flies to each pack in turn (TOPA_REC_HOLD seconds,
+// default 1, after start and after each landing settles), then quits
+// (or after TOPA_REC_FRAMES frames).
+// TOPA_REC_DBG=N: every Nth frame also dumps gNNNNN.ppm (the map before the
+// labels), dNNNNN_1.ppm (each pixel's slot 0-2 shares as rgb, magenta where
+// nothing covers) and dNNNNN_2..5.ppm (slot 0, 1, 2, 3 rendered alone).
+static int    g_rec = 0, rec_frame_n = 0, rec_was_flying = 0, rec_dbg = 0, rec_max = 0;
+static double rec_t = 0.0, rec_dt = 1.0 / 30.0, rec_hold = 1.0, rec_next = 0.0;
+static char   rec_dir[400], rec_fly[512];
+static FILE  *rec_trace = NULL;
+
+static double now_sec(void) { return g_rec ? rec_t : mono_sec() - t_start; }
 static double smooth01(double x) {           // smoothstep
     if (x < 0) x = 0;
     if (x > 1) x = 1;
@@ -480,7 +520,8 @@ static void build_ladder(void) {
 
 static int pack_in_use(int i) {
     return i == p_cur || (fly_active && i == fly_tgt) ||
-           i == s_slotpk[0] || i == s_slotpk[1] || i == s_slotpk[2];
+           i == s_slotpk[0] || i == s_slotpk[1] || i == s_slotpk[2] ||
+           i == s_slotpk[3];
 }
 
 // Idempotent: picks up packs that appeared since the last scan (packs are
@@ -579,26 +620,6 @@ static int pick_initial(int late) {
     return n_lad > 0 ? lad[n_lad - 1] : -1;
 }
 
-static unsigned char *read_bin(const char *path, const char *magic,
-                               unsigned int *w, unsigned int *h) {
-    FILE *f = fopen(path, "rb");
-    if (!f) return NULL;
-    char m[8];
-    if (fread(m, 1, 8, f) != 8 || memcmp(m, magic, 8) != 0 ||
-        fread(w, 4, 1, f) != 1 || fread(h, 4, 1, f) != 1 ||
-        *w == 0 || *h == 0 || *w > 8192 || *h > 8192) {
-        fprintf(stderr, "topopaper: bad %s\n", path); fclose(f); return NULL;
-    }
-    size_t nb = (size_t)*w * *h * 2;
-    unsigned char *buf = malloc(nb);
-    if (!buf || fread(buf, 1, nb, f) != nb) {
-        fprintf(stderr, "topopaper: truncated %s\n", path);
-        free(buf); fclose(f); return NULL;
-    }
-    fclose(f);
-    return buf;
-}
-
 static void upload_la(GLuint tex, int unit, int w, int h,
                       const unsigned char *data, GLint filter) {
     glActiveTexture(GL_TEXTURE0 + unit);
@@ -611,16 +632,16 @@ static void upload_la(GLuint tex, int unit, int w, int h,
                  GL_LUMINANCE_ALPHA, GL_UNSIGNED_BYTE, data);
 }
 
-static void upload_l(GLuint tex, int unit, int w, int h,
-                     const unsigned char *data) {
+static void upload_rgb(GLuint tex, int unit, int w, int h,
+                       const unsigned char *data) {
     glActiveTexture(GL_TEXTURE0 + unit);
     glBindTexture(GL_TEXTURE_2D, tex);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_LUMINANCE, w, h, 0,
-                 GL_LUMINANCE, GL_UNSIGNED_BYTE, data);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, w, h, 0,
+                 GL_RGB, GL_UNSIGNED_BYTE, data);
 }
 
 static void load_hud(void) {
@@ -830,59 +851,167 @@ static void chip_sync(double t) {
 // Load a pack's textures + labels (GL context must be current). Resident once
 // loaded — the ladder rebinds freely without re-uploading — until the LRU
 // cap (packs_gl_maint) evicts it.
+static void pack_gl_free(int idx);
+
+// ---- streaming uploads -------------------------------------------------------
+// A pack's textures go up in row strips (glTexSubImage2D) under a per-frame
+// byte budget, so no frame stalls on a whole pack: a flight queues the packs
+// its path will draw on in the order it reaches them (start_flight) and
+// stream_tick() feeds them in between frames. ensure_pack_gl() finishes a
+// pending pack at once: the backstop for anything not predicted.
+static void stream_close(struct pack *p) {
+    if (p->up_ft) fclose(p->up_ft);
+    if (p->up_ff) fclose(p->up_ff);
+    if (p->up_fwat) fclose(p->up_fwat);
+    free(p->up_wall);
+    p->up_ft = p->up_ff = p->up_fwat = NULL;
+    p->up_wall = NULL;
+    p->up_stage = 0;
+}
+
+static FILE *open_bin(const char *name, const char *file, const char *magic,
+                      unsigned int *w, unsigned int *h) {
+    char path[768];
+    snprintf(path, sizeof path, "%s/%s/%s", areas_dir, name, file);
+    FILE *f = fopen(path, "rb");
+    if (!f) return NULL;
+    char m[8];
+    if (fread(m, 1, 8, f) != 8 || memcmp(m, magic, 8) != 0 ||
+        fread(w, 4, 1, f) != 1 || fread(h, 4, 1, f) != 1 ||
+        *w == 0 || *h == 0 || *w > 8192 || *h > 8192) {
+        fprintf(stderr, "topopaper: bad %s\n", path); fclose(f); return NULL;
+    }
+    return f;
+}
+
+static void pack_finish(int idx);
+
+// Advance pack idx's upload by about `budget` bytes. 1 = resident, 0 = still
+// going, -1 = unusable (marked bad and off the ladder).
+static int pack_stream(int idx, size_t budget) {
+    struct pack *p = &packs[idx];
+    if (!p->have || p->bad) return -1;
+    if (p->gl_ok) return 1;
+    if (p->up_stage == 0) {
+        // open everything, validate, allocate the textures (cheap)
+        unsigned int tw, th, fw = 0, fh = 0, ww = 0, wh = 0;
+        p->up_ft = open_bin(p->name, "terrain.bin", "TOPOTER1", &tw, &th);
+        if (!p->up_ft) {
+            fprintf(stderr, "topopaper: pack '%s' has no usable terrain.bin, skipping it\n",
+                    p->name);
+            p->bad = 1;
+            g_lad_dirty = 1;
+            return -1;
+        }
+        p->ter_w = (int)tw; p->ter_h = (int)th;
+        // features (roads/runs L, lifts/borders A) and water (signed shore
+        // distance) share one RGB texture, so four slots fit the GLES2
+        // texture-unit budget. Builders write both at the terrain's size; a
+        // pack whose sizes differ gets its water resampled onto the features.
+        p->up_ff = open_bin(p->name, "features.bin", "TOPORDS1", &fw, &fh);
+        if (!p->up_ff) { fw = fh = 0; p->stL[5] = p->stA[5] = 0.0f; }
+        p->up_fwat = open_bin(p->name, "water.bin", "TOPOWTR1", &ww, &wh);
+        if (!p->up_fwat) ww = wh = 0;
+        if (!fw) { fw = ww ? ww : 1; fh = wh ? wh : 1; }
+        if (p->up_fwat && (ww != fw || wh != fh)) {
+            p->up_wall = malloc((size_t)ww * wh);
+            if (!p->up_wall || fread(p->up_wall, 1, (size_t)ww * wh, p->up_fwat) != (size_t)ww * wh) {
+                free(p->up_wall); p->up_wall = NULL; ww = wh = 0;
+            }
+            fclose(p->up_fwat); p->up_fwat = NULL;
+        }
+        p->fw_w = (int)fw; p->fw_h = (int)fh; p->wat_w = (int)ww; p->wat_h = (int)wh;
+        glGenTextures(1, &p->ter_tex);
+        upload_la(p->ter_tex, UNIT_TER[0], (int)tw, (int)th, NULL, GL_NEAREST);
+        glGenTextures(1, &p->fw_tex);
+        upload_rgb(p->fw_tex, UNIT_FW[0], (int)fw, (int)fh, NULL);
+        glActiveTexture(GL_TEXTURE0);
+        p->up_stage = 1; p->up_row = 0;
+    }
+    static unsigned char *buf = NULL, *buf2 = NULL;
+    static size_t cap = 0;
+    while (p->up_stage == 1 || p->up_stage == 2) {
+        int w = p->up_stage == 1 ? p->ter_w : p->fw_w;
+        int h = p->up_stage == 1 ? p->ter_h : p->fw_h;
+        size_t rowb = (size_t)w * (p->up_stage == 1 ? 2 : 3);
+        int n = (int)(budget / rowb);
+        if (n < 1) n = 1;
+        if (n > h - p->up_row) n = h - p->up_row;
+        if (cap < rowb * n) {
+            cap = rowb * n;
+            buf = realloc(buf, cap); buf2 = realloc(buf2, cap);
+            if (!buf || !buf2) { cap = 0; return 0; }
+        }
+        if (p->up_stage == 1) {
+            if (fread(buf, rowb, (size_t)n, p->up_ft) != (size_t)n) {
+                fprintf(stderr, "topopaper: truncated terrain.bin in '%s', skipping it\n", p->name);
+                stream_close(p);
+                pack_gl_free(idx);
+                p->bad = 1; g_lad_dirty = 1;
+                return -1;
+            }
+            glActiveTexture(GL_TEXTURE0 + UNIT_TER[0]);
+            glBindTexture(GL_TEXTURE_2D, p->ter_tex);
+            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, p->up_row, w, n,
+                            GL_LUMINANCE_ALPHA, GL_UNSIGNED_BYTE, buf);
+        } else {
+            // features (L,A) + water -> RGB rows; anything missing reads as
+            // "far from everything" / dry
+            size_t nf = (size_t)w * n;
+            int have_f = p->up_ff && fread(buf2, 2, nf, p->up_ff) == nf;
+            if (!have_f && p->up_ff) { fclose(p->up_ff); p->up_ff = NULL; }
+            unsigned char *wr = buf2 + nf * 2;   // water row bytes after features
+            int have_w = 0;
+            if (p->up_fwat) {
+                have_w = fread(wr, 1, nf, p->up_fwat) == nf;
+                if (!have_w) { fclose(p->up_fwat); p->up_fwat = NULL; }
+            }
+            for (int y = 0; y < n; y++)
+                for (int x = 0; x < w; x++) {
+                    size_t o = (size_t)y * w + x;
+                    unsigned char *d = buf + o * 3;
+                    d[0] = have_f ? buf2[o * 2] : 255;
+                    d[1] = have_f ? buf2[o * 2 + 1] : 255;
+                    if (have_w) d[2] = wr[o];
+                    else if (p->up_wall)
+                        d[2] = p->up_wall[(size_t)((p->up_row + y) * p->wat_h / h) * p->wat_w
+                                          + (size_t)x * p->wat_w / w];
+                    else d[2] = 255;
+                }
+            glActiveTexture(GL_TEXTURE0 + UNIT_FW[0]);
+            glBindTexture(GL_TEXTURE_2D, p->fw_tex);
+            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, p->up_row, w, n,
+                            GL_RGB, GL_UNSIGNED_BYTE, buf);
+        }
+        glActiveTexture(GL_TEXTURE0);
+        p->up_row += n;
+        if (p->up_row >= h) { p->up_stage++; p->up_row = 0; }
+        size_t used = rowb * n;
+        if (used >= budget) return p->up_stage == 3 ? (pack_finish(idx), 1) : 0;
+        budget -= used;
+    }
+    pack_finish(idx);
+    return 1;
+}
+
 static int ensure_pack_gl(int idx) {
     struct pack *p = &packs[idx];
     if (!p->have || p->bad) return 0;
     p->last_used = now_sec();
     if (p->gl_ok) return 1;
+    double t_up = mono_sec();
+    int r = pack_stream(idx, (size_t)-1);
+    if (r == 1) p->fade = 1.0f;              // needed now: no fade-in
+    if (r == 1 && fly_active)                // the prefetch missed it: a stall
+        fprintf(stderr, "topopaper: '%s' loaded on demand mid-flight (%.0f ms)\n",
+                p->name, (mono_sec() - t_up) * 1000.0);
+    return r == 1;
+}
+
+// labels + wrap mode, then the pack is resident
+static void pack_finish(int idx) {
+    struct pack *p = &packs[idx];
     char path[768];
-    snprintf(path, sizeof path, "%s/%s/terrain.bin", areas_dir, p->name);
-    unsigned int tw, th;
-    unsigned char *ter = read_bin(path, "TOPOTER1", &tw, &th);
-    if (!ter) {
-        fprintf(stderr, "topopaper: pack '%s' has no usable terrain.bin, skipping it\n",
-                p->name);
-        p->bad = 1;
-        g_lad_dirty = 1;
-        return 0;
-    }
-    glGenTextures(1, &p->ter_tex);
-    upload_la(p->ter_tex, UNIT_TER[0], tw, th, ter, GL_NEAREST);
-    free(ter);
-    p->ter_w = (int)tw; p->ter_h = (int)th;
-
-    glGenTextures(1, &p->feat_tex);
-    snprintf(path, sizeof path, "%s/%s/features.bin", areas_dir, p->name);
-    unsigned int fw, fh;
-    unsigned char *feat = read_bin(path, "TOPORDS1", &fw, &fh);
-    if (feat) {
-        upload_la(p->feat_tex, UNIT_FEAT[0], fw, fh, feat, GL_LINEAR);
-        free(feat);
-    } else {
-        unsigned char far2[2] = {255, 255};
-        upload_la(p->feat_tex, UNIT_FEAT[0], 1, 1, far2, GL_LINEAR);
-        p->stL[5] = p->stA[5] = 0.0f;
-    }
-
-    // water.bin: optional signed shore-distance (128 = shoreline, <128 water)
-    snprintf(path, sizeof path, "%s/%s/water.bin", areas_dir, p->name);
-    FILE *wf = fopen(path, "rb");
-    if (wf) {
-        char wm[8]; unsigned int ww, wh;
-        if (fread(wm, 1, 8, wf) == 8 && !memcmp(wm, "TOPOWTR1", 8) &&
-            fread(&ww, 4, 1, wf) == 1 && fread(&wh, 4, 1, wf) == 1 &&
-            ww > 0 && wh > 0 && ww <= 8192 && wh <= 8192) {
-            size_t nb = (size_t)ww * wh;
-            unsigned char *wb = malloc(nb);
-            if (wb && fread(wb, 1, nb, wf) == nb) {
-                glGenTextures(1, &p->water_tex);
-                upload_l(p->water_tex, UNIT_WAT[0], (int)ww, (int)wh, wb);
-            }
-            free(wb);
-        }
-        fclose(wf);
-    }
-
     p->n_lab = 0;
     snprintf(path, sizeof path, "%s/%s/labels.bin", areas_dir, p->name);
     FILE *f = fopen(path, "rb");
@@ -933,28 +1062,30 @@ static int ensure_pack_gl(int idx) {
         // full-world pack: wrap horizontally so bicubic taps cross the date
         // line instead of clamping into a seam column at 180° (visible now
         // that Pacific departures centre the seam on screen)
-        GLuint ts[3] = { p->ter_tex, p->feat_tex, p->water_tex };
-        for (int i = 0; i < 3; i++) if (ts[i]) {
+        GLuint ts[2] = { p->ter_tex, p->fw_tex };
+        for (int i = 0; i < 2; i++) if (ts[i]) {
             glBindTexture(GL_TEXTURE_2D, ts[i]);
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
         }
     }
     glActiveTexture(GL_TEXTURE0);
+    stream_close(p);
     p->gl_ok = 1;
     fprintf(stderr, "topopaper: resident '%s' %dx%d step %.0fm %d labels\n",
             p->name, p->ter_w, p->ter_h, p->step, p->n_lab);
-    return 1;
 }
 
 static void pack_gl_free(int idx) {
     struct pack *p = &packs[idx];
-    if (!p->gl_ok) return;
-    GLuint t[4] = { p->ter_tex, p->feat_tex, p->atlas_tex, p->water_tex };
-    for (int i = 0; i < 4; i++) if (t[i]) glDeleteTextures(1, &t[i]);
-    p->ter_tex = p->feat_tex = p->atlas_tex = p->water_tex = 0;
+    if (p->up_stage) stream_close(p);
+    else if (!p->gl_ok) return;
+    GLuint t[3] = { p->ter_tex, p->fw_tex, p->atlas_tex };
+    for (int i = 0; i < 3; i++) if (t[i]) glDeleteTextures(1, &t[i]);
+    p->ter_tex = p->fw_tex = p->atlas_tex = 0;
     p->n_lab = 0;
     memset(p->lab_vis, 0, sizeof p->lab_vis);
     p->gl_ok = 0;
+    p->fade = 0.0f;
 }
 
 // Once per tick (GL current): re-upload packs rebuilt on disk, release the
@@ -1030,6 +1161,68 @@ static void idle_cam(int idx, double *ox, double *oy, double *oh) {
 
 // van Wijk & Nuij "Smooth and efficient zooming and panning" (2003):
 // the optimal pan+zoom path between two camera rects, parameterized by s.
+static int ladder_weights(double cx, double cy, double ch, double *ovl,
+                          int *idxw, double *wsl, double *wlf);
+static int view_container(double cx, double cy, double ch);
+static int pack_stream(int idx, size_t budget);
+static void flight_cam(double s, double *ox, double *oy, double *oh);
+static int g_preq[MAXRES], g_npreq = 0;    // flight prefetch, in need order
+
+// One frame's share of the prefetch: upload ~STREAM_BUDGET bytes of the
+// first queued packs not yet resident (they stay protected from the LRU
+// for the flight via last_used).
+#define STREAM_BUDGET (3u << 20)
+// queue a pack for streaming; urgent = ahead of everything (in view now)
+static void stream_want(int idx, int urgent) {
+    int at = -1;
+    for (int j = 0; j < g_npreq; j++) if (g_preq[j] == idx) at = j;
+    if (at >= 0 && !urgent) return;
+    if (at < 0) {
+        if (g_npreq >= MAXRES) return;
+        at = g_npreq++;
+    }
+    for (int j = at; j > 0 && urgent; j--) g_preq[j] = g_preq[j - 1];
+    if (urgent) g_preq[0] = idx; else g_preq[at] = idx;
+}
+
+static void stream_tick(void) {
+    size_t budget = STREAM_BUDGET;
+    for (int j = 0; j < g_npreq && budget > 0; j++) {
+        struct pack *p = &packs[g_preq[j]];
+        p->last_used = now_sec();
+        if (p->gl_ok || p->bad || !p->have) continue;
+        pack_stream(g_preq[j], budget);
+        budget = 0;                          // one pack per frame
+    }
+}
+
+// van Wijk & Nuij path parameters from the departure camera (f_c0, f_w0)
+// to a target camera. Re-planned every frame toward the target's LIVE idle
+// pose (see step_world), in the asinh form that stays exact as the pan
+// distance shrinks to nothing (an ascent to the spinning globe starts as a
+// pure zoom that the spin then pulls sideways).
+static void plan_flight(double tx, double ty, double th) {
+    f_c1x = tx; f_c1y = ty; f_w1 = th;
+    double dx = f_c1x - f_c0x, dy = f_c1y - f_c0y;
+    f_d = sqrt(dx * dx + dy * dy);
+    if (f_d < 1e-14 * (f_w0 + f_w1)) {
+        f_pure = 1;
+        f_S = fabs(log(f_w1 / f_w0)) / RHO;
+        if (f_S < 1e-6) f_S = 1e-6;
+        f_ux = 0; f_uy = 0;
+    } else {
+        f_pure = 0;
+        f_ux = dx / f_d; f_uy = dy / f_d;
+        double r4 = RHO * RHO * RHO * RHO;
+        double b0 = (f_w1 * f_w1 - f_w0 * f_w0 + r4 * f_d * f_d) /
+                    (2.0 * f_w0 * RHO * RHO * f_d);
+        double b1 = (f_w1 * f_w1 - f_w0 * f_w0 - r4 * f_d * f_d) /
+                    (2.0 * f_w1 * RHO * RHO * f_d);
+        f_r0 = -asinh(b0);                   // = log(-b + sqrt(b*b + 1))
+        f_S = (asinh(b0) - asinh(b1)) / RHO;   // (r1 - r0) / RHO
+    }
+}
+
 static void start_flight(int tgt) {
     fly_tgt = tgt;
     g_fly_start = now_sec();
@@ -1046,53 +1239,42 @@ static void start_flight(int tgt) {
         if (s < -1.0) s = -1.0;
         ph_pb = asin(s);
     }
-    idle_cam(tgt, &f_c1x, &f_c1y, &f_w1);
-    {
-        // every rung between here and there that lies along the way renders
-        // mid-dive — make those resident up front (the corridor test keeps a
-        // big registry from uploading same-scale packs on other continents;
-        // anything missed still loads on demand when it enters the view)
-        int a = ladder_pos(p_cur), b = ladder_pos(tgt);
-        if (a < 0) a = b;
-        int klo = a < b ? a : b, khi = a > b ? a : b, n = 0;
-        double m = 0.5 * (f_w0 > f_w1 ? f_w0 : f_w1) * g_ar;
-        double rx0 = (f_c0x < f_c1x ? f_c0x : f_c1x) - m;
-        double rx1 = (f_c0x > f_c1x ? f_c0x : f_c1x) + m;
-        double ry0 = (f_c0y < f_c1y ? f_c0y : f_c1y) - m;
-        double ry1 = (f_c0y > f_c1y ? f_c0y : f_c1y) + m;
-        for (int k = klo; k >= 0 && k <= khi && n < MAXRES - 4; k++) {
-            struct pack *p = &packs[lad[k]];
-            if (p->mx0 > rx1 || p->mx0 + p->msx < rx0 ||
-                p->my0 > ry1 || p->my0 + p->msy < ry0) continue;
-            if (ensure_pack_gl(lad[k])) n++;
-        }
-    }
-    double dx = f_c1x - f_c0x, dy = f_c1y - f_c0y;
-    f_d = sqrt(dx * dx + dy * dy);
-    if (f_d < 1e-12) {
-        f_pure = 1;
-        f_S = fabs(log(f_w1 / f_w0)) / RHO;
-        if (f_S < 1e-6) f_S = 1e-6;
-        f_ux = 0; f_uy = 0;
-    } else {
-        f_pure = 0;
-        f_ux = dx / f_d; f_uy = dy / f_d;
-        double r4 = RHO * RHO * RHO * RHO;
-        double b0 = (f_w1 * f_w1 - f_w0 * f_w0 + r4 * f_d * f_d) /
-                    (2.0 * f_w0 * RHO * RHO * f_d);
-        double b1 = (f_w1 * f_w1 - f_w0 * f_w0 - r4 * f_d * f_d) /
-                    (2.0 * f_w1 * RHO * RHO * f_d);
-        double r1;
-        f_r0 = log(-b0 + sqrt(b0 * b0 + 1.0));
-        r1   = log(-b1 + sqrt(b1 * b1 + 1.0));
-        f_S = (r1 - f_r0) / RHO;
-    }
-    fly_T = 2.5 + 2.2 * fabs(f_S);
-    if (fly_T < 3.5) fly_T = 3.5;
-    if (fly_T > 9.0) fly_T = 9.0;
+    double tx, ty, th;
+    idle_cam(tgt, &tx, &ty, &th);
+    plan_flight(tx, ty, th);
+    // Duration follows the configured flight length. The van Wijk path effort
+    // |f_S| sizes each trip within that: a long globe-to-valley descent takes
+    // about the full flight_seconds, shorter hops proportionally less, with a
+    // floor so a tiny re-centre never crawls (and never snaps).
+    double frac = fabs(f_S) / 2.3;           // 2.3 ~ a globe-scale descent
+    if (frac > 1.0) frac = 1.0;
+    if (frac < 0.3) frac = 0.3;
+    fly_T = cfg.flight_seconds * frac;
+    if (fly_T < 1.0) fly_T = 1.0;
     fly_t = 0.0;
     fly_active = 1;
     g_vis = 0.0; roam_next = -1.0;           // roam clock restarts per flight
+    // PREFETCH: walk the path through the weight law and queue every pack
+    // it will draw on (and each view's coverage container) in the order the
+    // flight reaches them; stream_tick() uploads them between frames
+    {
+        static double ov[MAXPACKS], ws[MAXPACKS], lf[MAXPACKS];
+        static int id[MAXPACKS];
+        g_npreq = 0;
+        for (int i = 0; i <= 120 && g_npreq < MAXRES - 4; i++) {
+            double x, y, h;
+            flight_cam(f_S * i / 120.0, &x, &y, &h);
+            int n = ladder_weights(x, y, h, ov, id, ws, lf);
+            for (int k = 0; k <= n; k++) {
+                int pk = k < n ? id[k] : view_container(x, y, h);
+                if (k < n && ws[k] < 0.02) continue;     // slivers: never drawn
+
+                int seen = 0;
+                for (int j = 0; j < g_npreq; j++) if (g_preq[j] == pk) seen = 1;
+                if (!seen && g_npreq < MAXRES - 4) g_preq[g_npreq++] = pk;
+            }
+        }
+    }
     fprintf(stderr, "topopaper: flight %s -> %s  S=%.2f T=%.1fs\n",
             packs[p_cur].name, packs[tgt].name, f_S, fly_T);
 }
@@ -1105,7 +1287,8 @@ static void flight_cam(double s, double *ox, double *oy, double *oh) {
         return;
     }
     double rs = RHO * s + f_r0;
-    double u = (f_w0 / (RHO * RHO)) * (cosh(f_r0) * tanh(rs) - sinh(f_r0));
+    // cosh(r0)tanh(rs) - sinh(r0) == sinh(RHO s)/cosh(rs): no cancellation
+    double u = (f_w0 / (RHO * RHO)) * sinh(RHO * s) / cosh(rs);
     *oh = f_w0 * cosh(f_r0) / cosh(rs);
     *ox = f_c0x + f_ux * u;
     *oy = f_c0y + f_uy * u;
@@ -1293,7 +1476,7 @@ static const char *FRAG =
     "uniform vec2 uRes;\n"
     "uniform float uCrawlM, uCpu, uNight;\n"
     "uniform vec2 uFam;\n"    // fractal contour family: base step s (m), band phase t
-    "uniform vec3 uW;\n"                     // slot weights (telescoped, sum<=1)
+    "uniform vec4 uW;\n"                     // slot weights (w = coverage container)
     "uniform float uRadPx;\n"     // ortho sphere radius in px = res.y/(ch*2pi*cos(lat0))
     "uniform vec2 uGlobeC;\n"                // view-centre lon,lat (radians)
     "uniform vec3 uSun;\n"                   // sun dir, view-centre ENU frame
@@ -1303,14 +1486,26 @@ static const char *FRAG =
     // theme palette (engine/themes.h), pushed whenever the theme changes
     "uniform vec3 uBgLo, uBgHi, uLnLo, uLnHi, uWatC, uShoreC, uSnowC, uWarmC;\n"
     "uniform vec3 uRimC, uIceC, uAurA, uAurB;\n"
-    "uniform vec3 uWrap;\n"                  // per-slot: 1 = full-world pack, wrap u
-    "uniform sampler2D uTer0, uFeat0, uTer1, uFeat1, uWat0, uWat1, uTer2;\n"
+    "uniform vec4 uWrap;\n"                  // per-slot: 1 = full-world pack, wrap u
+    "uniform float uDbg;\n"
+    // shared shading scale of this frame's blend (see shade_common): relief
+    // baseline (mercator units), relief gain per metre, line-colour ramp
+    // floor + span (metres)
+    "uniform vec4 uHs;\n"
+    "uniform vec4 uFG;\n"                    // per-slot feature gate (see feat_gates)
+    "uniform vec4 uFE0, uFE1, uFE2, uFE3;\n"  // per-slot bbox edge on screen: left,right,top,bottom
+    "uniform mat4 uFin;\n"                   // uFin[i][j] = 1: slot j is finer than slot i
+    "uniform mat4 uSib;\n"                   // uSib[i][j] = 1: slots i, j share a scale                  // TOPA_REC_DBG: 1 slot shares, 2-4 slot 0-2 alone
+    "uniform sampler2D uTer0, uFW0, uTer1, uFW1, uTer2, uFW2, uTer3, uFW3;\n"
     "uniform vec2 uTexel0, uTC0, uTS0;\n"
     "uniform vec2 uTexel1, uTC1, uTS1;\n"
     "uniform vec2 uTexel2, uTC2, uTS2;\n"
-    "uniform vec4 uCtr0, uCtr1, uCtr2;\n"   // x levScale, y levOff, z 1/step, w px-per-texel
+    "uniform vec2 uTexel3, uTC3, uTS3;\n"
+    "uniform vec4 uCtr0, uCtr1, uCtr2, uCtr3;\n"   // x levScale, y levOff, z 1/step, w px-per-texel
     "uniform vec3 uFcL0, uFpL0, uFcA0, uFpA0;\n"  // colour rgb | w0,w1,opacity
     "uniform vec3 uFcL1, uFpL1, uFcA1, uFpA1;\n"
+    "uniform vec3 uFcL2, uFpL2, uFcA2, uFpA2;\n"
+    "uniform vec3 uFcL3, uFpL3, uFcA3, uFpA3;\n"
     // ---- 16-bit heightmap sampling (hi in .r, lo in .a) --------------------
     "float terS(sampler2D t, vec2 uv){ vec4 s=texture2D(t,uv); return s.r*0.9961090+s.a*0.0038911; }\n"
     // plain bilinear — used only for the hillshade gradient (broad soft signal)
@@ -1319,7 +1514,7 @@ static const char *FRAG =
     "  vec2 b=(i+0.5)*texel;\n"
     "  return mix(mix(terS(t,b),terS(t,b+vec2(texel.x,0.)),f.x),\n"
     "             mix(terS(t,b+vec2(0.,texel.y)),terS(t,b+texel),f.x),f.y); }\n"
-    // plain B-spline bicubic on a single .r channel — used for the water
+    // plain B-spline bicubic on the water (.b) channel — used for the water
     // SDF when a coarse pack rides far above its native scale (bilinear
     // texel diamonds read as staircase coasts under ~10x magnification)
     "float watBic(sampler2D t, vec2 texel, vec2 uv){\n"
@@ -1335,7 +1530,7 @@ static const char *FRAG =
     "    float rv=0.0;\n"
     "    for(int i=-1;i<=2;i++){\n"
     "      float w=(i==-1)?wx.x:((i==0)?wx.y:((i==1)?wx.z:wx.w));\n"
-    "      rv+=w*texture2D(t,b+vec2(float(i),float(j))*texel).r;\n"
+    "      rv+=w*texture2D(t,b+vec2(float(i),float(j))*texel).b;\n"
     "    }\n"
     "    float wj=(j==-1)?wy.x:((j==0)?wy.y:((j==1)?wy.z:wy.w));\n"
     "    s+=wj*rv;\n"
@@ -1372,11 +1567,28 @@ static const char *FRAG =
     // once the view outsizes the pack — the bbox edge then reads as a hard
     // LOD wall against the coarse rung (the tetons west-edge chunk). Clamped
     // low so a deep overhang can never feather a sole cover provider to zero.
+    // A token tail reaches 2 px past the edge: where the sphere's corners
+    // overhang every pack by a pixel or two, the nearest edge texels fill in
+    // (elsewhere it is a 1e-4 share).
     "float slotCov(vec2 uv, vec2 texel){\n"
-    "  vec2 m=clamp(fwidth(uv)*80.0, texel*2.5, vec2(0.2));\n"
+    "  vec2 fw=fwidth(uv);\n"
+    "  vec2 m=clamp(fw*80.0, texel*2.5, vec2(0.2));\n"
     "  vec2 f=max(max(m-uv, uv-(1.0-m)), vec2(0.0))/m;\n"
     "  float d=max(f.x, f.y);\n"
-    "  return 1.0-smoothstep(0.0, 1.0, d); }\n"
+    "  vec2 o=max(-uv, uv-1.0)/max(fw, vec2(1e-12));\n"   // px outside
+    "  float tail=1e-4*(1.0-smoothstep(0.0, 2.0, max(o.x, o.y)));\n"
+    "  return max(1.0-smoothstep(0.0, 1.0, d), tail); }\n"
+    // features fade over a wide band (a quarter of the screen height) from each
+    // bbox edge that is ON screen (fe = 0 for edges at or past the screen
+    // border, so an idle view touching its pack's edge loses nothing): a
+    // road network then thins out toward a pack's edge instead of stopping
+    // at a straight line
+    "float featCov(vec2 uv, vec4 fe){\n"
+    "  vec2 fw=max(fwidth(uv), vec2(1e-12));\n"
+    "  float wd=0.25*uRes.y;\n"
+    "  vec4 d=vec4(uv.x/fw.x, (1.0-uv.x)/fw.x, (1.0-uv.y)/fw.y, uv.y/fw.y);\n"
+    "  vec4 f=mix(vec4(1.0), smoothstep(vec4(0.0), vec4(wd), d), fe);\n"
+    "  return f.x*f.y*f.z*f.w; }\n"
     // one contour family: line intensity at step s for absolute metres hm,
     // with the fwidth anti-moiré damper doubling as the data-quality floor
     // (families too fine for a slot's texels self-suppress)
@@ -1388,9 +1600,11 @@ static const char *FRAG =
     "  float l=1.0-smoothstep(w, w+g, d);\n"
     "  return l*(1.0-smoothstep(0.18, 0.42, g)); }\n"
     // ---- full real-terrain colour for one slot (uv-space core) -------------
-    "vec3 slotRealUV(vec2 uv, sampler2D ter, sampler2D feat, sampler2D wat,\n"
-    "                vec2 texel, vec4 ctr,\n"
-    "                vec3 fcL, vec3 fpL, vec3 fcA, vec3 fpA){\n"
+    // terrain colour of one slot; its feature alphas (roads/runs, lifts/
+    // borders) come back in fa for the shared feature layer
+    "vec3 slotRealUV(vec2 uv, sampler2D ter, sampler2D fw,\n"
+    "                vec2 texel, vec2 ts, vec4 ctr,\n"
+    "                vec3 fpL, vec3 fpA, out vec2 fa){\n"
     "  float h=terBic(ter, texel, uv);\n"
     "  float hm=ctr.x+h*ctr.y+uCrawlM;\n"    // absolute metres + global crawl
     // FRACTAL FAMILIES: fine=s fades with band phase t; mid=5s morphs
@@ -1410,21 +1624,30 @@ static const char *FRAG =
     "  float major=max(lM*(1.0-uFam.y), lS);\n"
     // water: signed shore distance (0.502 = shoreline, below = water).
     // contours/index lines stop at the shore; fill + crisp shoreline below.
-    "  float wd=(ctr.w>3.0)?watBic(wat, texel, uv):texture2D(wat, uv).r;\n"
+    "  float wd=(ctr.w>3.0)?watBic(fw, texel, uv):texture2D(fw, uv).b;\n"
     "  float land=smoothstep(0.494, 0.514, wd);\n"
     "  minor*=land; major*=land;\n"
     "  vec2 suvy=gl_FragCoord.xy/uRes.xy;\n"
     "  vec3 base=mix(uBgLo, uBgHi, suvy.y);\n"
-    "  vec2 gx=vec2(texel.x*2.4, 0.0);\n"
-    "  vec2 gy=vec2(0.0, texel.y*2.4);\n"
+    // relief: every slot measures the slope over the SAME ground baseline
+    // and shades it with the same gain, so overlapping packs agree (each
+    // pack's own texel-and-range scaling made a pack's rectangle read
+    // brighter or flatter than its neighbour). At rest that common scale is
+    // the pack's own: 4.8 of its texels, 80 per elevation range. A coarse
+    // pack never samples finer than its own 4.8 texels (bilinear facets);
+    // its slope is rescaled to the common baseline instead.
+    "  float bl=max(uHs.x, 4.8*texel.y/(6.28318531*ts.y));\n"
+    "  vec2 o=bl*3.14159265*ts;\n"
+    "  vec2 gx=vec2(o.x, 0.0);\n"
+    "  vec2 gy=vec2(0.0, o.y);\n"
     "  vec2 g2=vec2(terBil(ter,texel,uv+gx)-terBil(ter,texel,uv-gx),\n"
-    "               terBil(ter,texel,uv+gy)-terBil(ter,texel,uv-gy));\n"
-    "  vec3 nrm=normalize(vec3(-g2.x*80.0, -g2.y*80.0, 1.0));\n"
+    "               terBil(ter,texel,uv+gy)-terBil(ter,texel,uv-gy))*ctr.y*uHs.y*(uHs.x/bl);\n"
+    "  vec3 nrm=normalize(vec3(-g2.x, -g2.y, 1.0));\n"
     "  float sh=clamp(dot(nrm, normalize(uSunH.xyz)), 0.0, 1.0);\n"
     "  base*=mix(1.0, 0.64+0.68*sh, 0.50);\n"
     "  base=mix(base, base*vec3(1.26,1.02,0.84), uSunH.w*sh*0.50);\n"
     "  float lineOp=0.75;\n"
-    "  vec3 lc=mix(uLnLo, uLnHi, clamp(h*0.85,0.0,1.0));\n"
+    "  vec3 lc=mix(uLnLo, uLnHi, clamp((hm-uCrawlM-uHs.z)/uHs.w*0.85,0.0,1.0));\n"
     "  vec3 col=mix(base, lc, minor*0.45*lineOp);\n"
     "  col=mix(col, lc*1.22, major*0.60*lineOp);\n"
     "  vec3 wcol=mix(base, uWatC, 0.62);\n"
@@ -1436,49 +1659,13 @@ static const char *FRAG =
     // crawl removed); roads/labels draw after, so passes stay plowed
     "  float sn=smoothstep(uSnow, uSnow+140.0, hm-uCrawlM)*land;\n"
     "  col=mix(col, uSnowC, sn*0.42);\n"
-    "  vec2 rdt=texture2D(feat, uv).ra;\n"
-    "  float dL=rdt.x*31.875*ctr.w;\n"
-    "  float dA=rdt.y*31.875*ctr.w;\n"
-    "  float sL=1.0-smoothstep(fpL.x, fpL.y, dL);\n"
-    "  float sA=1.0-smoothstep(fpA.x, fpA.y, dA);\n"
-    "  col=mix(col, fcL, sL*fpL.z);\n"
-    "  col=mix(col, fcA, sA*fpA.z);\n"
     "  float line=max(minor, major);\n"
     "  col=mix(col, uWarmC, line*uCpu*0.28);\n"
-    "  return col; }\n"
-    // GUARANTOR (slot 2): terrain-only backfill for view overhangs — the
-    // coverage deficit of slots 0/1 lands here. Contours + hillshade from
-    // ter2; water derived from raw elevation (<=0 m: bathymetry carries the
-    // oceans, lakes are absent — acceptable for brief edge backfill).
-    "vec3 slotG(vec2 uv){\n"
-    "  float hh=terBic(uTer2, uTexel2, uv);\n"
-    "  float hm=uCtr2.x+hh*uCtr2.y+uCrawlM;\n"
-    "  float lF=lineAt(hm, uFam.x);\n"
-    "  float lM=lineAt(hm, uFam.x*5.0);\n"
-    "  float lS=lineAt(hm, uFam.x*25.0);\n"
-    "  float minor=max(lF*(1.0-uFam.y), lM*uFam.y);\n"
-    "  float major=max(lM*(1.0-uFam.y), lS);\n"
-    "  float em=uCtr2.x+hh*uCtr2.y;\n"
-    "  float land=smoothstep(0.0, 6.0, em);\n"
-    "  minor*=land; major*=land;\n"
-    "  vec2 suvy=gl_FragCoord.xy/uRes.xy;\n"
-    "  vec3 base=mix(uBgLo, uBgHi, suvy.y);\n"
-    "  vec2 gx=vec2(uTexel2.x*2.4, 0.0);\n"
-    "  vec2 gy=vec2(0.0, uTexel2.y*2.4);\n"
-    "  vec2 g2=vec2(terBil(uTer2,uTexel2,uv+gx)-terBil(uTer2,uTexel2,uv-gx),\n"
-    "               terBil(uTer2,uTexel2,uv+gy)-terBil(uTer2,uTexel2,uv-gy));\n"
-    "  vec3 nrm=normalize(vec3(-g2.x*80.0, -g2.y*80.0, 1.0));\n"
-    "  float sh=clamp(dot(nrm, normalize(uSunH.xyz)), 0.0, 1.0);\n"
-    "  base*=mix(1.0, 0.64+0.68*sh, 0.50);\n"
-    "  base=mix(base, base*vec3(1.26,1.02,0.84), uSunH.w*sh*0.50);\n"
-    "  vec3 lc=mix(uLnLo, uLnHi, clamp(hh*0.85,0.0,1.0));\n"
-    "  vec3 col=mix(base, lc, minor*0.45*0.75);\n"
-    "  col=mix(col, lc*1.22, major*0.60*0.75);\n"
-    "  vec3 wcol=mix(base, uWatC, 0.62);\n"
-    "  col=mix(wcol, col, land);\n"
-    "  float sn=smoothstep(uSnow, uSnow+140.0, em)*land;\n"
-    "  col=mix(col, uSnowC, sn*0.42);\n"
-    "  col=mix(col, uWarmC, max(minor,major)*uCpu*0.28);\n"
+    "  vec2 rdt=texture2D(fw, uv).rg;\n"
+    "  float dL=rdt.x*31.875*ctr.w;\n"
+    "  float dA=rdt.y*31.875*ctr.w;\n"
+    "  fa=vec2((1.0-smoothstep(fpL.x, fpL.y, dL))*fpL.z,\n"
+    "          (1.0-smoothstep(fpA.x, fpA.y, dA))*fpA.z);\n"
     "  return col; }\n"
     "void main(){\n"
     "  vec2 suv=gl_FragCoord.xy/uRes.xy;\n"
@@ -1496,6 +1683,7 @@ static const char *FRAG =
     "  float zz=sqrt(max(1.0-min(dot(q,q),1.0), 0.0));\n"
     "  float sdot=dot(vec3(q, zz), uSun);\n"
     "  float aurA=0.0; vec3 aurC=vec3(0.0);\n"
+    "  float onp=0.0;\n"                       // on the planet (night dims only it)
     "  if(rr<1.0+edge){\n"
     "    float rr2=min(dot(q,q), 1.0);\n"
     "    float z=zz;\n"
@@ -1518,32 +1706,78 @@ static const char *FRAG =
     "    if(uWrap.x>0.5) cl0.x=uv0.x;\n"
     "    vec2 cvv0=uv0; if(uWrap.x>0.5) cvv0.x=0.5;\n"
     "    float cov0=slotCov(cvv0, uTexel0);\n"
-    "    vec3 c0=slotRealUV(cl0, uTer0, uFeat0, uWat0, uTexel0, uCtr0,\n"
-    "                       uFcL0, uFpL0, uFcA0, uFpA0);\n"
+    "    vec2 fa0, fa1=vec2(0.0), fa2=vec2(0.0), fa3=vec2(0.0);\n"
+    "    float cov1=0.0, cov2=0.0, cov3=0.0;\n"
+    "    vec3 c0=slotRealUV(cl0, uTer0, uFW0, uTexel0, uTS0, uCtr0,\n"
+    "                       uFpL0, uFpA0, fa0);\n"
     "    float w0v=uW.x*cov0;\n"
     "    float w1v=0.0; vec3 c1=vec3(0.0);\n"
+    "    vec2 uv1=uTC1+D*uTS1, uv2=uTC2+D*uTS2, uv3=uTC3+D*uTS3;\n"
     "    if (uW.y > 0.001) {\n"
-    "      vec2 uv1=uTC1+D*uTS1;\n"
     "      vec2 cl1=clamp(uv1, uTexel1*2.5, 1.0-uTexel1*2.5);\n"
     "      if(uWrap.y>0.5) cl1.x=uv1.x;\n"
     "      vec2 cvv1=uv1; if(uWrap.y>0.5) cvv1.x=0.5;\n"
-    "      float cov1=slotCov(cvv1, uTexel1);\n"
-    "      c1=slotRealUV(cl1, uTer1, uFeat1, uWat1, uTexel1, uCtr1,\n"
-    "                    uFcL1, uFpL1, uFcA1, uFpA1);\n"
+    "      cov1=slotCov(cvv1, uTexel1);\n"
+    "      c1=slotRealUV(cl1, uTer1, uFW1, uTexel1, uTS1, uCtr1,\n"
+    "                    uFpL1, uFpA1, fa1);\n"
     "      w1v=uW.y*cov1;\n"
     "    }\n"
     "    float w2v=0.0; vec3 c2=vec3(0.0);\n"
     "    if (uW.z > 0.001) {\n"
-    "      vec2 uv2=uTC2+D*uTS2;\n"
     "      vec2 cl2=clamp(uv2, uTexel2*2.5, 1.0-uTexel2*2.5);\n"
     "      if(uWrap.z>0.5) cl2.x=uv2.x;\n"
     "      vec2 cvv2=uv2; if(uWrap.z>0.5) cvv2.x=0.5;\n"
-    "      float cov2=slotCov(cvv2, uTexel2);\n"
-    "      c2=slotG(cl2);\n"
+    "      cov2=slotCov(cvv2, uTexel2);\n"
+    "      c2=slotRealUV(cl2, uTer2, uFW2, uTexel2, uTS2, uCtr2,\n"
+    "                    uFpL2, uFpA2, fa2);\n"
     "      w2v=uW.z*cov2;\n"
     "    }\n"
-    "    float tot=w0v+w1v+w2v;\n"
-    "    vec3 terr=(tot>1e-4)?(c0*w0v+c1*w1v+c2*w2v)/tot:bg;\n"
+    // slot 3: the coverage container at a token weight (it only shows
+    // where nothing else covers)
+    "    float w3v=0.0; vec3 c3=vec3(0.0);\n"
+    "    if (uW.w > 0.0) {\n"
+    "      vec2 cl3=clamp(uv3, uTexel3*2.5, 1.0-uTexel3*2.5);\n"
+    "      if(uWrap.w>0.5) cl3.x=uv3.x;\n"
+    "      vec2 cvv3=uv3; if(uWrap.w>0.5) cvv3.x=0.5;\n"
+    "      cov3=slotCov(cvv3, uTexel3);\n"
+    "      c3=slotRealUV(cl3, uTer3, uFW3, uTexel3, uTS3, uCtr3,\n"
+    "                    uFpL3, uFpA3, fa3);\n"
+    "      w3v=uW.w*cov3;\n"
+    "    }\n"
+    "    float tot=w0v+w1v+w2v+w3v;\n"
+    "    if(uDbg>0.5){\n"                       // void = magenta
+    "      gl_FragColor=vec4(uDbg<1.5?(tot>0.0?vec3(w0v,w1v,w2v)/tot:vec3(1.0,0.0,1.0))\n"
+    "                        :uDbg<2.5?c0:uDbg<3.5?c1:uDbg<4.5?c2:c3, 1.0);\n"
+    "      return; }\n"
+    // tot is never 0 on screen (the container covers); at a bbox's very
+    // edge it can be tiny, so only an exact 0 falls back to slot 0's edge
+    "    vec3 terr=(tot>0.0)?(c0*w0v+c1*w1v+c2*w2v+c3*w3v)/tot:c0;\n"
+    // FEATURE LAYER: roads, runs, lifts and borders composite on top of the
+    // blended terrain instead of riding each slot's share, so a pack's road
+    // network never shows as a faint rectangle while it covers only part of
+    // the view. Each slot inks at its gate (uFG: on once its scale covers
+    // most of the view, fading with its weight), and a finer slot's inked
+    // area takes over from coarser slots (the same roads, sharper), so
+    // shared roads keep one strength across the hand-off.
+    // same-scale siblings split their overlap by share (two ski areas
+    // whose boxes overlap must not both ink the shared runs)
+    "    vec4 wc=vec4(w0v, w1v, w2v, w3v);\n"
+    "    vec4 sib=vec4(wc.x/max(dot(uSib[0],wc),1e-6), wc.y/max(dot(uSib[1],wc),1e-6),\n"
+    "                  wc.z/max(dot(uSib[2],wc),1e-6), wc.w/max(dot(uSib[3],wc),1e-6));\n"
+    "    vec4 gc=uFG*vec4(cov0, cov1, cov2, cov3);\n"
+    "    vec4 sup=vec4(1.0);\n"
+    "    for(int i=0;i<4;i++){\n"
+    "      vec4 f=uFin[i];\n"
+    "      float v=(1.0-f.x*gc.x)*(1.0-f.y*gc.y)*(1.0-f.z*gc.z)*(1.0-f.w*gc.w);\n"
+    "      if(i==0) sup.x=v; else if(i==1) sup.y=v; else if(i==2) sup.z=v; else sup.w=v;\n"
+    "    }\n"
+    "    vec4 fcv=vec4(featCov(uv0, uFE0), featCov(uv1, uFE1), featCov(uv2, uFE2), featCov(uv3, uFE3));\n"
+    "    vec4 ka=gc*sup*sib*fcv;\n"
+    "    vec4 aL=ka*vec4(fa0.x, fa1.x, fa2.x, fa3.x);\n"
+    "    vec4 aA=ka*vec4(fa0.y, fa1.y, fa2.y, fa3.y);\n"
+    "    float tL=dot(aL, vec4(1.0)), tA=dot(aA, vec4(1.0));\n"
+    "    if(tL>1e-4) terr=mix(terr, (uFcL0*aL.x+uFcL1*aL.y+uFcL2*aL.z+uFcL3*aL.w)/tL, min(tL,1.0));\n"
+    "    if(tA>1e-4) terr=mix(terr, (uFcA0*aA.x+uFcA1*aA.y+uFcA2*aA.z+uFcA3*aA.w)/tA, min(tA,1.0));\n"
     "    terr*=0.72+0.28*z;\n"          // limb darkening; ==1.0 up close
     // dusk band: warm cast where the sun grazes the terminator's day side
     "    float band=1.0-smoothstep(0.0, 0.26, abs(sdot-0.02));\n"
@@ -1586,16 +1820,19 @@ static const char *FRAG =
     "               smoothstep(0.0,-1.5,dc));\n"
     "    }\n"
     "    col=mix(space, terr, lm);\n"
+    "    onp=lm;\n"
     "  }\n"
     // night per FRAGMENT (was uniform uNight): same dim+desat constants as
     // ever, but driven by sdot — up close it equals the old whole-screen
-    // night; on the globe it resolves into the real day/night terminator
-    "  float nf=1.0-smoothstep(-0.12, 0.10, sdot);\n"
+    // night; on the globe it resolves into the real day/night terminator.
+    // Space stays put: dimmed by the sun direction it pulsed with every
+    // fast pan of the globe
+    "  float nf=(1.0-smoothstep(-0.12, 0.10, sdot))*onp;\n"
     "  col *= (1.0 - 0.34*nf);\n"
     "  col = mix(col, vec3(dot(col, vec3(0.333))), 0.30*nf);\n"
     "  col += aurC*aurA;\n"
     "  float vig = 1.0 - 0.28*pow(clamp(length(suv-vec2(0.5,0.42))/0.72,0.0,1.0),1.6);\n"
-    "  gl_FragColor = vec4(col*vig, 1.0);\n"
+    "  gl_FragColor = vec4(uDbg>0.5 ? vec3(0.0) : col*vig, 1.0);\n"
     "}\n";
 
 // ---- city-lights shaders (additive warm points on the globe's night side) --
@@ -1692,13 +1929,17 @@ void engine_gl_init(void) {
     u_cpu     = glGetUniformLocation(prog, "uCpu");
     u_night   = glGetUniformLocation(prog, "uNight");
     u_w       = glGetUniformLocation(prog, "uW");
-    u_texel2  = glGetUniformLocation(prog, "uTexel2");
-    u_tc2     = glGetUniformLocation(prog, "uTC2");
-    u_ts2     = glGetUniformLocation(prog, "uTS2");
-    u_ctr2    = glGetUniformLocation(prog, "uCtr2");
     u_fam     = glGetUniformLocation(prog, "uFam");
-    glUniform1i(glGetUniformLocation(prog, "uTer2"), UNIT_TER2);
     u_radpx   = glGetUniformLocation(prog, "uRadPx");
+    u_dbg     = glGetUniformLocation(prog, "uDbg");
+    u_hs      = glGetUniformLocation(prog, "uHs");
+    u_fg      = glGetUniformLocation(prog, "uFG");
+    u_fin     = glGetUniformLocation(prog, "uFin");
+    u_sib     = glGetUniformLocation(prog, "uSib");
+    {
+        static const char *fen[4] = { "uFE0", "uFE1", "uFE2", "uFE3" };
+        for (int i = 0; i < 4; i++) u_fe[i] = glGetUniformLocation(prog, fen[i]);
+    }
     u_globec  = glGetUniformLocation(prog, "uGlobeC");
     u_sun     = glGetUniformLocation(prog, "uSun");
     u_sunh    = glGetUniformLocation(prog, "uSunH");
@@ -1708,10 +1949,12 @@ void engine_gl_init(void) {
     static const char *thn[12] = { "uBgLo", "uBgHi", "uLnLo", "uLnHi", "uWatC",
         "uShoreC", "uSnowC", "uWarmC", "uRimC", "uIceC", "uAurA", "uAurB" };
     for (int i = 0; i < 12; i++) u_th[i] = glGetUniformLocation(prog, thn[i]);
-    const char *names[2][8] = {
+    const char *names[4][8] = {
         {"uTexel0","uTC0","uTS0","uCtr0","uFcL0","uFpL0","uFcA0","uFpA0"},
-        {"uTexel1","uTC1","uTS1","uCtr1","uFcL1","uFpL1","uFcA1","uFpA1"}};
-    for (int i = 0; i < 2; i++) {
+        {"uTexel1","uTC1","uTS1","uCtr1","uFcL1","uFpL1","uFcA1","uFpA1"},
+        {"uTexel2","uTC2","uTS2","uCtr2","uFcL2","uFpL2","uFcA2","uFpA2"},
+        {"uTexel3","uTC3","uTS3","uCtr3","uFcL3","uFpL3","uFcA3","uFpA3"}};
+    for (int i = 0; i < 4; i++) {
         u_texel[i] = glGetUniformLocation(prog, names[i][0]);
         u_tc[i]    = glGetUniformLocation(prog, names[i][1]);
         u_ts[i]    = glGetUniformLocation(prog, names[i][2]);
@@ -1726,26 +1969,22 @@ void engine_gl_init(void) {
     glBufferData(GL_ARRAY_BUFFER, sizeof(quad), quad, GL_STATIC_DRAW);
 
     glUseProgram(prog);
-    glUniform1i(glGetUniformLocation(prog, "uTer0"),  UNIT_TER[0]);
-    glUniform1i(glGetUniformLocation(prog, "uFeat0"), UNIT_FEAT[0]);
-    glUniform1i(glGetUniformLocation(prog, "uTer1"),  UNIT_TER[1]);
-    glUniform1i(glGetUniformLocation(prog, "uFeat1"), UNIT_FEAT[1]);
-    glUniform1i(glGetUniformLocation(prog, "uWat0"),  UNIT_WAT[0]);
-    glUniform1i(glGetUniformLocation(prog, "uWat1"),  UNIT_WAT[1]);
-    unsigned char flat[2] = {0, 0}, far2[2] = {255, 255}, dry[1] = {255};
+    static const char *smp[4][2] = {{"uTer0","uFW0"},{"uTer1","uFW1"},{"uTer2","uFW2"},
+                                    {"uTer3","uFW3"}};
+    for (int i = 0; i < 4; i++) {
+        glUniform1i(glGetUniformLocation(prog, smp[i][0]), UNIT_TER[i]);
+        glUniform1i(glGetUniformLocation(prog, smp[i][1]), UNIT_FW[i]);
+    }
+    unsigned char flat[2] = {0, 0}, dryfar[3] = {255, 255, 255};
     glGenTextures(1, &ph_ter_tex);
-    glGenTextures(1, &ph_feat_tex);
-    glGenTextures(1, &ph_wat_tex);
+    glGenTextures(1, &ph_fw_tex);
     upload_la(ph_ter_tex, UNIT_TER[0], 1, 1, flat, GL_NEAREST);
-    upload_la(ph_feat_tex, UNIT_FEAT[0], 1, 1, far2, GL_LINEAR);
-    upload_l(ph_wat_tex, UNIT_WAT[0], 1, 1, dry);
-    for (int i = 0; i < 2; i++) {           // all units start on placeholders
+    upload_rgb(ph_fw_tex, UNIT_FW[0], 1, 1, dryfar);
+    for (int i = 0; i < 4; i++) {
         glActiveTexture(GL_TEXTURE0 + UNIT_TER[i]);
         glBindTexture(GL_TEXTURE_2D, ph_ter_tex);
-        glActiveTexture(GL_TEXTURE0 + UNIT_FEAT[i]);
-        glBindTexture(GL_TEXTURE_2D, ph_feat_tex);
-        glActiveTexture(GL_TEXTURE0 + UNIT_WAT[i]);
-        glBindTexture(GL_TEXTURE_2D, ph_wat_tex);
+        glActiveTexture(GL_TEXTURE0 + UNIT_FW[i]);
+        glBindTexture(GL_TEXTURE_2D, ph_fw_tex);
     }
     glActiveTexture(GL_TEXTURE0);
 
@@ -1843,6 +2082,192 @@ static void theme_feat(const float *baked, float *out) {
     memcpy(out, baked, 3 * sizeof(float));
 }
 
+// The weight law for a camera (centre cx,cy, view height ch): fills ovl[]
+// (view overlap per ladder rung) and the weighted packs idxw[]/wsl[] with
+// their label factors wlf[]; returns how many. step_world() draws with it,
+// start_flight() predicts a flight's packs with it.
+//
+// Candidates = packs whose bbox intersects the VIEW rectangle: a sibling
+// pack at the same scale but elsewhere on the map (Tetons vs Wind
+// Rivers) must never blend in by height alone, while a flight corridor
+// naturally picks up each area the camera overflies. When nothing
+// qualifies (a lone remote pack), fall back to the nearest centre.
+// Every rung's weight is a continuous function of camera state. Drivers:
+//  - SHARPNESS YIELD: a rung hands off only as the NEXT rung's texels
+//    approach 1 screen px — sharp-for-sharp swaps are invisible at any
+//    screen size. (The old arrival-height bands completed while the
+//    coarse rung was still ~1.8x magnified: visible softening, detail
+//    loading out while it was still significant.) The yield is
+//    scaled by the next rung's own view overlap, so a sliver pack
+//    (yellowstone-region clipping a glacier descent) can't pull the
+//    handoff early.
+//  - VIEW OVERLAP: weight scales with the fraction of the view covered —
+//    slivers never claim the blend; packs fade out BEFORE their bbox
+//    exits the view (no candidacy-exit pops).
+// Weights telescope fine->coarse; the leftover coverage deficit flows
+// upward and lands on whatever covers.
+static int ladder_weights(double cx, double cy, double ch, double *ovl,
+                          int *idxw, double *wsl, double *wlf) {
+    double hxv = ch * g_ar * 0.5, hyv = ch * 0.5;
+    double vx0 = cx - hxv, vx1 = cx + hxv;
+    double vy0 = cy - hyv, vy1 = cy + hyv;
+    double varea = (vx1 - vx0) * (vy1 - vy0);
+    for (int k = 0; k < n_lad; k++) {
+        struct pack *p = &packs[lad[k]];
+        double ox0 = p->mx0 > vx0 ? p->mx0 : vx0;
+        double oy0 = p->my0 > vy0 ? p->my0 : vy0;
+        double ox1 = p->mx0 + p->msx < vx1 ? p->mx0 + p->msx : vx1;
+        double oy1 = p->my0 + p->msy < vy1 ? p->my0 + p->msy : vy1;
+        ovl[k] = (ox1 > ox0 && oy1 > oy0)
+                 ? (ox1 - ox0) * (oy1 - oy0) / varea : 0.0;
+    }
+    // ---- SIBLING LAW --------------------------------------------------------
+    // Rungs of one scale are one LAYER. The ladder is walked in scale GROUPS
+    // (msy within 5%); inside a group the members split the group's take by
+    // TERRITORY: the member whose centre is nearest the camera (in units of
+    // its own size) leads and takes its whole view coverage, the others take
+    // only the coverage they ADD past the leaders' edges. Before this, every
+    // same-scale pack covering the view took its full coverage in ladder
+    // (= qsort) order — isle-royale-region drew level with apostle-islands-
+    // region over the Apostles (two rosters, two waters, one screen) — and
+    // the sharpness yield consulted lad[k+1], usually a same-scale STRANGER
+    // with no view overlap, so the yield was dead and hand-offs fell back
+    // to coverage loss. The yield now looks at the next COARSER covering
+    // group. Preference is soft (the two leaders blend where territories
+    // meet) so every weight stays continuous in camera state. Labels follow
+    // territory: a member that only fills a sliver keeps its roster down
+    // (label factor = share of its own coverage it won).
+    int nslw = 0;
+    double rem = 1.0;
+    int gk = 0;
+    while (gk < n_lad && rem > 1e-4) {
+        int g0 = gk; double gm = packs[lad[g0]].msy;
+        while (gk < n_lad && packs[lad[gk]].msy < gm * 1.05) gk++;   // group [g0,gk)
+        int mem[MAXSIB], nm = 0;
+        for (int k = g0; k < gk && nm < MAXSIB; k++) if (ovl[k] > 0.0) mem[nm++] = k;
+        if (!nm) continue;
+        double yield = 0.0;                  // next coarser COVERING group
+        for (int h0 = gk; h0 < n_lad; ) {
+            double hm = packs[lad[h0]].msy; int h1 = h0, best = -1;
+            double bo = 0.0, uni = 0.0;
+            while (h1 < n_lad && packs[lad[h1]].msy < hm * 1.05) {
+                if (ovl[h1] > bo) { bo = ovl[h1]; best = h1; }
+                uni += ovl[h1]; h1++;
+            }
+            if (best >= 0) {
+                struct pack *q = &packs[lad[best]];
+                double hs = q->msy * ((double)g_scr_h / (double)(q->ter_h > 0 ? q->ter_h : 2048));
+                if (hs > 1e-12) {
+                    yield = smooth01(log(ch / hs) / log(1.6));
+                    if (uni > 1.0) uni = 1.0;
+                    double os = uni / 0.5;       // sliver yieldee -> hold on
+                    if (os < 1.0) yield *= os;
+                }
+                break;
+            }
+            h0 = h1;
+        }
+        double tt = rem * (1.0 - yield);
+        double pref[MAXSIB], gov[MAXSIB], gpo[MAXSIB][MAXSIB];
+        for (int i = 0; i < nm; i++) {
+            struct pack *p = &packs[lad[mem[i]]];
+            double sig = 0.5 * (p->msx < p->msy ? p->msx : p->msy);
+            double ddx = cx - (p->mx0 + p->msx * 0.5);
+            double ddy = cy - (p->my0 + p->msy * 0.5);
+            if (p->msx > 0.999) { ddx = 0.0; ddy = 0.0; }   // world packs own everything
+            pref[i] = exp(-(ddx * ddx + ddy * ddy) / (sig * sig));
+        }
+        for (int i = 1; i < nm; i++) {       // order by preference (nm is tiny)
+            int t = mem[i]; double pt = pref[i]; int j = i - 1;
+            while (j >= 0 && pref[j] < pt) { mem[j+1] = mem[j]; pref[j+1] = pref[j]; j--; }
+            mem[j+1] = t; pref[j+1] = pt;
+        }
+        for (int i = 0; i < nm; i++) {
+            gov[i] = ovl[mem[i]];
+            for (int j = 0; j < nm; j++)
+                gpo[i][j] = (i == j) ? gov[i]
+                          : rect_ovl3(&packs[lad[mem[i]]], &packs[lad[mem[j]]],
+                                      vx0, vy0, vx1, vy1, varea);
+        }
+        int ord[MAXSIB]; for (int i = 0; i < nm; i++) ord[i] = i;
+        double takeA[MAXSIB], takeB[MAXSIB];
+        alloc_terr(nm, ord, gov, gpo, tt, takeA);
+        double s = 1.0;                      // soft swap of the two leaders
+        if (nm >= 2) {
+            double x = (pref[0] - pref[1]) / (0.35 * (pref[0] + pref[1]) + 1e-12);
+            s = 0.5 + 0.5 * smooth01(x);     // tie -> 50/50, clearly apart -> pure order
+            if (s < 0.999) {
+                ord[0] = 1; ord[1] = 0;
+                alloc_terr(nm, ord, gov, gpo, tt, takeB);
+            }
+        }
+        for (int i = 0; i < nm; i++) {
+            double take = (s < 0.999) ? s * takeA[i] + (1.0 - s) * takeB[i] : takeA[i];
+            if (take > 1e-4) {
+                wsl[nslw] = take; idxw[nslw] = lad[mem[i]];
+                double own = tt * gov[i];
+                wlf[nslw] = own > 1e-9 ? take / own : 0.0;
+                if (wlf[nslw] > 1.0) wlf[nslw] = 1.0;
+                nslw++;
+            }
+            rem -= take;
+        }
+    }
+    if (!nslw) {                             // camera outside everything: nearest
+        double best = 1e18; int bi = lad[0];
+        for (int k = 0; k < n_lad; k++) {
+            struct pack *p = &packs[lad[k]];
+            double ddx = cx - (p->mx0 + p->msx * 0.5);
+            double ddy = cy - (p->my0 + p->msy * 0.5);
+            if (ddx*ddx + ddy*ddy < best) { best = ddx*ddx + ddy*ddy; bi = lad[k]; }
+        }
+        wsl[0] = 1.0; idxw[0] = bi; wlf[0] = 1.0; nslw = 1;
+    }
+    return nslw;
+}
+
+// The coverage container for a camera: the finest pack whose bbox holds the
+// whole visible ground — earth at worst. The footprint is un-projected from
+// points along the screen border exactly as the shader projects (a mercator
+// rectangle of the view height misses the sphere's latitude scale by about
+// a pixel at the screen edge: a bare row there); slotCov's 2 px tail covers
+// what falls between the points.
+static int view_container(double cx, double cy, double ch) {
+    double glat = atan(sinh(M_PI * (1.0 - 2.0 * cy)));
+    if (glat >  1.05) glat =  1.05;                      // as step_world
+    if (glat < -1.05) glat = -1.05;
+    double sla = sin(glat), cla = cos(glat);
+    double hq = 0.5 * ch * 2.0 * M_PI * cla;             // half screen height in q
+    double x0 = 1e9, x1 = -1e9, y0 = 1e9, y1 = -1e9;
+    for (int i = 0; i < 16; i++) {                       // the border, 16 points
+        double t = (i % 4) / 3.0, ex, ey;
+        switch (i / 4) {
+            case 0:  ex = -1.0 + 2.0 * t; ey = -1.0; break;
+            case 1:  ex = -1.0 + 2.0 * t; ey =  1.0; break;
+            case 2:  ex = -1.0; ey = -1.0 + 2.0 * t; break;
+            default: ex =  1.0; ey = -1.0 + 2.0 * t; break;
+        }
+        double qx = ex * g_ar * hq, qy = ey * hq;
+        double r2 = qx * qx + qy * qy;
+        if (r2 >= 1.0) return lad[n_lad - 1];            // past the limb: the globe
+        double z = sqrt(1.0 - r2);
+        double lat = asin(qy * cla + z * sla);
+        double lon = atan2(qx, z * cla - qy * sla);
+        double mx = cx + lon / (2.0 * M_PI);
+        double my = 0.5 - log(tan(M_PI / 4.0 + lat / 2.0)) / (2.0 * M_PI);
+        if (mx < x0) x0 = mx;
+        if (mx > x1) x1 = mx;
+        if (my < y0) y0 = my;
+        if (my > y1) y1 = my;
+    }
+    for (int k = 0; k < n_lad; k++) {                    // fine -> coarse
+        struct pack *p = &packs[lad[k]];
+        if ((p->msx > 0.999 || (p->mx0 <= x0 && p->mx0 + p->msx >= x1)) &&
+            p->my0 <= y0 && p->my0 + p->msy >= y1) return lad[k];
+    }
+    return lad[n_lad - 1];                               // the coarsest (earth)
+}
+
 // Advance the world by dt. Called once per frame tick, however many outputs
 // then draw that frame (each output stepping it ran the world N times fast).
 static void step_world(void) {
@@ -1933,23 +2358,26 @@ static void step_world(void) {
     if (fly_active == 1) {
         fly_t += mdt;
         double tau = fly_t / fly_T;
-        double s = f_S * smoother01(tau);
-        flight_cam(s, &cam_x, &cam_y, &cam_h);
-        // chase the LIVE idle pose: the wander/spin phases advance during
-        // the flight, so the pose targeted at start is stale by arrival —
-        // landing on it caused a visible correction pan in the landing
-        // blend (a quick pan at the end for no reason). Blend the target's
-        // drift in with progress: touchdown lands exactly on the current
-        // idle pose and the landing blend has nothing left to cover.
+        // aim at the LIVE idle pose: the wander/spin phases advance during
+        // the flight, so the pose targeted at start is stale by arrival
+        // (landing on it was a visible correction pan). Re-planning the path
+        // to it every frame lands exactly on the current pose, and the
+        // drift is absorbed where the path is zoomed out. (Adding the drift
+        // as an offset instead whipped the camera sideways near the ground:
+        // on an ascent to the globe the spin is dozens of views wide down
+        // there.)
         {
             double ix, iy, ih;
             idle_cam(fly_tgt, &ix, &iy, &ih);
-            double dk = smoother01(tau);
-            cam_x += (ix - f_c1x) * dk;
-            cam_y += (iy - f_c1y) * dk;
-            cam_h += (ih - f_w1) * dk;
+            plan_flight(ix, iy, ih);
         }
+        double s = f_S * smoother01(tau);
+        flight_cam(s, &cam_x, &cam_y, &cam_h);
         if (tau >= 1.0) {
+            int m = 0;                       // the flight's prefetch is done
+            for (int j = 0; j < g_npreq; j++)
+                if (!packs[g_preq[j]].gl_ok && !packs[g_preq[j]].bad) g_preq[m++] = g_preq[j];
+            g_npreq = m;
             p_cur = fly_tgt;
             fly_active = 2;
             land_t = 0.0;
@@ -1970,148 +2398,40 @@ static void step_world(void) {
         maybe_roam(dt);
     }
 
-    // ---- ladder pair: rungs bracketing the camera height -------------------
-    // Candidates = packs whose bbox intersects the VIEW rectangle: a sibling
-    // pack at the same scale but elsewhere on the map (Tetons vs Wind
-    // Rivers) must never blend in by height alone, while a flight corridor
-    // naturally picks up each area the camera overflies. When nothing
-    // qualifies (a lone remote pack), fall back to the nearest centre.
-    // ---- LADDER WEIGHTS: continuous by construction (the law) -------------
-    // Every rung's weight is a continuous function of camera state. Drivers:
-    //  - SHARPNESS YIELD: a rung hands off only as the NEXT rung's texels
-    //    approach 1 screen px — sharp-for-sharp swaps are invisible at any
-    //    screen size. (The old arrival-height bands completed while the
-    //    coarse rung was still ~1.8x magnified: visible softening, detail
-    //    loading out while it was still significant.) The yield is
-    //    scaled by the next rung's own view overlap, so a sliver pack
-    //    (yellowstone-region clipping a glacier descent) can't pull the
-    //    handoff early.
-    //  - VIEW OVERLAP: weight scales with the fraction of the view covered —
-    //    slivers never claim the blend; packs fade out BEFORE their bbox
-    //    exits the view (no candidacy-exit pops).
-    // Weights telescope fine->coarse; the leftover coverage deficit flows
-    // upward and lands on whatever covers (the guarantor emerges naturally
-    // in slot 2, rendered terrain-only).
-    double hxv = cam_h * g_ar * 0.5, hyv = cam_h * 0.5;
-    double vx0 = cam_x - hxv, vx1 = cam_x + hxv;
-    double vy0 = cam_y - hyv, vy1 = cam_y + hyv;
+    // ---- ladder weights (the law: see ladder_weights) ----------------------
+    static double ovl[MAXPACKS], wsl[MAXPACKS], wlf[MAXPACKS];
+    static int idxw[MAXPACKS];
+    int nslw = ladder_weights(cam_x, cam_y, cam_h, ovl, idxw, wsl, wlf);
+    // RESIDENCY: only resident packs draw, each fading in over ~0.15 s once
+    // its textures are up. A pack the weight law wants that isn't resident
+    // yet streams in at the front of the queue meanwhile (no frame ever
+    // stalls on it); the coarser packs that cover its ground carry the
+    // picture until it arrives. Only a view left mostly uncovered, or the
+    // coverage container, loads on the spot.
+    {
+        float kf = 1.0f - expf((float)(-dt / 0.15));
+        for (int i = 0; i < n_packs; i++)
+            if (packs[i].gl_ok) packs[i].fade += (1.0f - packs[i].fade) * kf;
+        double tot = 0.0, top = -1.0; int topk = -1;
+        for (int k = 0; k < nslw; k++) {
+            struct pack *p = &packs[idxw[k]];
+            if (wsl[k] > top) { top = wsl[k]; topk = k; }
+            if (!p->gl_ok && wsl[k] > 1e-3) stream_want(idxw[k], 1);
+            wsl[k] *= p->gl_ok ? p->fade : 0.0f;
+            tot += wsl[k];
+        }
+        if (tot < 0.25 && topk >= 0 && !packs[idxw[topk]].gl_ok &&
+            ensure_pack_gl(idxw[topk]))
+            wsl[topk] = top;                 // the backstop: show it now
+    }
+    double vx0 = cam_x - cam_h * g_ar * 0.5, vx1 = cam_x + cam_h * g_ar * 0.5;
+    double vy0 = cam_y - cam_h * 0.5, vy1 = cam_y + cam_h * 0.5;
     double varea = (vx1 - vx0) * (vy1 - vy0);
-    double ovl[MAXPACKS];
-    for (int k = 0; k < n_lad; k++) {
-        struct pack *p = &packs[lad[k]];
-        double ox0 = p->mx0 > vx0 ? p->mx0 : vx0;
-        double oy0 = p->my0 > vy0 ? p->my0 : vy0;
-        double ox1 = p->mx0 + p->msx < vx1 ? p->mx0 + p->msx : vx1;
-        double oy1 = p->my0 + p->msy < vy1 ? p->my0 + p->msy : vy1;
-        ovl[k] = (ox1 > ox0 && oy1 > oy0)
-                 ? (ox1 - ox0) * (oy1 - oy0) / varea : 0.0;
-    }
-    // ---- SIBLING LAW --------------------------------------------------------
-    // Rungs of one scale are one LAYER. The ladder is walked in scale GROUPS
-    // (msy within 5%); inside a group the members split the group's take by
-    // TERRITORY: the member whose centre is nearest the camera (in units of
-    // its own size) leads and takes its whole view coverage, the others take
-    // only the coverage they ADD past the leaders' edges. Before this, every
-    // same-scale pack covering the view took its full coverage in ladder
-    // (= qsort) order — isle-royale-region drew level with apostle-islands-
-    // region over the Apostles (two rosters, two waters, one screen) — and
-    // the sharpness yield consulted lad[k+1], usually a same-scale STRANGER
-    // with no view overlap, so the yield was dead and hand-offs fell back
-    // to coverage loss. The yield now looks at the next COARSER covering
-    // group. Preference is soft (the two leaders blend where territories
-    // meet) so every weight stays continuous in camera state. Labels follow
-    // territory: a member that only fills a sliver keeps its roster down
-    // (label factor = share of its own coverage it won).
-    double wsl[MAXPACKS]; int nslw = 0; int idxw[MAXPACKS]; double wlf[MAXPACKS];
-    double rem = 1.0;
-    int gk = 0;
-    while (gk < n_lad && rem > 1e-4) {
-        int g0 = gk; double gm = packs[lad[g0]].msy;
-        while (gk < n_lad && packs[lad[gk]].msy < gm * 1.05) gk++;   // group [g0,gk)
-        int mem[MAXSIB], nm = 0;
-        for (int k = g0; k < gk && nm < MAXSIB; k++) if (ovl[k] > 0.0) mem[nm++] = k;
-        if (!nm) continue;
-        double yield = 0.0;                  // next coarser COVERING group
-        for (int h0 = gk; h0 < n_lad; ) {
-            double hm = packs[lad[h0]].msy; int h1 = h0, best = -1;
-            double bo = 0.0, uni = 0.0;
-            while (h1 < n_lad && packs[lad[h1]].msy < hm * 1.05) {
-                if (ovl[h1] > bo) { bo = ovl[h1]; best = h1; }
-                uni += ovl[h1]; h1++;
-            }
-            if (best >= 0) {
-                struct pack *q = &packs[lad[best]];
-                double hs = q->msy * ((double)g_scr_h / (double)(q->ter_h > 0 ? q->ter_h : 2048));
-                if (hs > 1e-12) {
-                    yield = smooth01(log(cam_h / hs) / log(1.6));
-                    if (uni > 1.0) uni = 1.0;
-                    double os = uni / 0.5;       // sliver yieldee -> hold on
-                    if (os < 1.0) yield *= os;
-                }
-                break;
-            }
-            h0 = h1;
-        }
-        double tt = rem * (1.0 - yield);
-        double pref[MAXSIB], gov[MAXSIB], gpo[MAXSIB][MAXSIB];
-        for (int i = 0; i < nm; i++) {
-            struct pack *p = &packs[lad[mem[i]]];
-            double sig = 0.5 * (p->msx < p->msy ? p->msx : p->msy);
-            double ddx = cam_x - (p->mx0 + p->msx * 0.5);
-            double ddy = cam_y - (p->my0 + p->msy * 0.5);
-            if (p->msx > 0.999) { ddx = 0.0; ddy = 0.0; }   // world packs own everything
-            pref[i] = exp(-(ddx * ddx + ddy * ddy) / (sig * sig));
-        }
-        for (int i = 1; i < nm; i++) {       // order by preference (nm is tiny)
-            int t = mem[i]; double pt = pref[i]; int j = i - 1;
-            while (j >= 0 && pref[j] < pt) { mem[j+1] = mem[j]; pref[j+1] = pref[j]; j--; }
-            mem[j+1] = t; pref[j+1] = pt;
-        }
-        for (int i = 0; i < nm; i++) {
-            gov[i] = ovl[mem[i]];
-            for (int j = 0; j < nm; j++)
-                gpo[i][j] = (i == j) ? gov[i]
-                          : rect_ovl3(&packs[lad[mem[i]]], &packs[lad[mem[j]]],
-                                      vx0, vy0, vx1, vy1, varea);
-        }
-        int ord[MAXSIB]; for (int i = 0; i < nm; i++) ord[i] = i;
-        double takeA[MAXSIB], takeB[MAXSIB];
-        alloc_terr(nm, ord, gov, gpo, tt, takeA);
-        double s = 1.0;                      // soft swap of the two leaders
-        if (nm >= 2) {
-            double x = (pref[0] - pref[1]) / (0.35 * (pref[0] + pref[1]) + 1e-12);
-            s = 0.5 + 0.5 * smooth01(x);     // tie -> 50/50, clearly apart -> pure order
-            if (s < 0.999) {
-                ord[0] = 1; ord[1] = 0;
-                alloc_terr(nm, ord, gov, gpo, tt, takeB);
-            }
-        }
-        for (int i = 0; i < nm; i++) {
-            double take = (s < 0.999) ? s * takeA[i] + (1.0 - s) * takeB[i] : takeA[i];
-            if (take > 1e-4) {
-                wsl[nslw] = take; idxw[nslw] = lad[mem[i]];
-                double own = tt * gov[i];
-                wlf[nslw] = own > 1e-9 ? take / own : 0.0;
-                if (wlf[nslw] > 1.0) wlf[nslw] = 1.0;
-                nslw++;
-            }
-            rem -= take;
-        }
-    }
-    if (!nslw) {                             // camera outside everything: nearest
-        double best = 1e18; int bi = lad[0];
-        for (int k = 0; k < n_lad; k++) {
-            struct pack *p = &packs[lad[k]];
-            double ddx = cam_x - (p->mx0 + p->msx * 0.5);
-            double ddy = cam_y - (p->my0 + p->msy * 0.5);
-            if (ddx*ddx + ddy*ddy < best) { best = ddx*ddx + ddy*ddy; bi = lad[k]; }
-        }
-        wsl[0] = 1.0; idxw[0] = bi; wlf[0] = 1.0; nslw = 1;
-    }
-    // top-3 by weight -> slots (slot0 = dominant; slot2 = guarantor tail).
-    // slot2 renders (w3rd - w4th): as two packs converge on 3rd place the
-    // rendered guarantor fades to zero, so its identity crossover happens
-    // AT zero weight — the truncation edge stays continuous too.
+    // top-3 by weight -> slots 0-2 (slot0 = dominant). Every rendered
+    // weight is (w - 4th weight): as two packs converge on 3rd place the
+    // rendered slot fades to zero, so its identity crossover happens AT zero
+    // weight and pop-ins start at exactly 0; per-pixel normalization
+    // rescales, idle (no 4th) is untouched
     int ord[4] = {-1, -1, -1, -1};
     for (int k = 0; k < nslw; k++)
         for (int j = 0; j < 4; j++)
@@ -2123,23 +2443,69 @@ static void step_world(void) {
     int b  = ord[1] >= 0 ? idxw[ord[1]] : a;
     int gg = ord[2] >= 0 ? idxw[ord[2]] : -1;
     double w4  = ord[3] >= 0 ? wsl[ord[3]] : 0.0;
-    // subtract the 4th weight from ALL rendered slots: every rank crossing
-    // then happens at equal rendered weights and pop-ins start at exactly 0;
-    // per-pixel normalization rescales, idle (w4=0) is untouched
     double w0v = ord[0] >= 0 ? wsl[ord[0]] - w4 : 1.0;
     double w1v = ord[1] >= 0 ? wsl[ord[1]] - w4 : 0.0;
     double w2v = ord[2] >= 0 ? wsl[ord[2]] - w4 : 0.0;
-    if (w0v < 1e-4) w0v = 1e-4;
     if (w1v < 0.0) w1v = 0.0;
     if (w2v < 0.0) w2v = 0.0;
+    // COVERAGE GUARANTEE (slot 3): the finest pack whose bbox holds the
+    // whole view (view_container) renders at a
+    // token weight whenever slots 0-2 don't already hold it. The top-3 cut
+    // alone could drop the only pack covering part of the screen, which then
+    // went bare until the ranks moved on (a strip below sw-montana while two
+    // ski sites outweighed yellowstone-region). Where others cover, the
+    // token is a ~1% share; where nothing else does, it is the picture.
+#define CONTAIN_EPS 0.01
+    // (idle views stay inside their pack by construction: no extra slot)
+    int cont = fly_active ? view_container(cam_x, cam_y, cam_h) : -1;
+    double w3v = 0.0;
+    if (cont < 0 || cont == a || cont == b || cont == gg || !ensure_pack_gl(cont)) cont = -1;
+    else w3v = CONTAIN_EPS;
+    if (w0v < 1e-4) w0v = 1e-4;
     if (a < 0) a = p_cur >= 0 ? p_cur : lad[0];
-    ensure_pack_gl(a);                       // backstop; flights preload ahead
-    if (b != a && !ensure_pack_gl(b)) { b = a; w1v = 0.0; }
-    if (gg >= 0 && !ensure_pack_gl(gg)) { gg = -1; w2v = 0.0; }
-    s_slotpk[0] = a; s_slotpk[1] = b; s_slotpk[2] = gg;
-    g_w0v = (float)w0v; g_w1v = (float)w1v; g_w2v = (float)w2v;
-    g_lf0 = ord[0] >= 0 ? (float)wlf[ord[0]] : 1.0f;
-    g_lf1 = ord[1] >= 0 ? (float)wlf[ord[1]] : 1.0f;
+    ensure_pack_gl(a);                       // resident unless nothing is
+    if (b != a && !packs[b].gl_ok) { b = a; w1v = 0.0; }
+    if (gg >= 0 && !packs[gg].gl_ok) { gg = -1; w2v = 0.0; }
+    s_slotpk[0] = a; s_slotpk[1] = b; s_slotpk[2] = gg; s_slotpk[3] = cont;
+    g_w0v = (float)w0v; g_w1v = (float)w1v; g_w2v = (float)w2v; g_w3v = (float)w3v;
+    // FEATURE GATES (shader feature layer): a slot's roads/lifts/borders ink
+    // once its scale group covers most of the view (fine-only roads never
+    // show as a rectangle) and fade with its weight (nothing inks as it
+    // leaves the slots). uFin orders the slots by scale for the hand-over.
+    {
+        double wvs[4] = { w0v, b != a ? w1v : 0.0, w2v, w3v };
+        for (int i = 0; i < 4; i++) {
+            int pi = s_slotpk[i];
+            g_fg[i] = 0.0f;
+            for (int j = 0; j < 4; j++) g_fin[i * 4 + j] = g_sib[i * 4 + j] = 0.0f;
+            g_sib[i * 4 + i] = 1.0f;
+            if (pi < 0 || wvs[i] <= 0.0) continue;
+            double gm = packs[pi].msy, uni = 0.0;
+            int gk_[MAXSIB], ng = 0;
+            for (int k = 0; k < n_lad && ng < MAXSIB; k++) {
+                double m = packs[lad[k]].msy;
+                if (m > gm / 1.05 && m < gm * 1.05 && ovl[k] > 0.0) gk_[ng++] = k;
+            }
+            for (int x = 0; x < ng; x++) {
+                uni += ovl[gk_[x]];
+                for (int y = x + 1; y < ng; y++)
+                    uni -= rect_ovl3(&packs[lad[gk_[x]]], &packs[lad[gk_[y]]],
+                                     vx0, vy0, vx1, vy1, varea);
+            }
+            if (packs[pi].msx > 0.999) uni = 1.0;
+            g_fg[i] = (float)(smooth01((uni - 0.7) / 0.3) * smooth01(wvs[i] / 0.15));
+            for (int j = 0; j < 4; j++) {
+                int pj = s_slotpk[j];
+                if (j != i && pj >= 0 && pj != pi && packs[pj].msy < gm * 0.95)
+                    g_fin[i * 4 + j] = 1.0f;
+                if (j != i && pj >= 0 && packs[pj].msy > gm / 1.05 && packs[pj].msy < gm * 1.05)
+                    g_sib[i * 4 + j] = 1.0f;
+            }
+        }
+        for (int i = 0; i < 4; i++)              // a pack doubled into two slots inks once
+            for (int j = 0; j < i; j++) if (s_slotpk[j] == s_slotpk[i]) g_fg[i] = 0.0f;
+    }
+    for (int j = 0; j < 3; j++) g_lf[j] = ord[j] >= 0 ? (float)wlf[ord[j]] : 1.0f;
     {   // TOPA_DEBUG=1: per-frame camera/slot trace for jump hunting
         static int dbg = -1;
         if (dbg < 0) dbg = getenv("TOPA_DEBUG") != NULL;
@@ -2149,6 +2515,18 @@ static void step_world(void) {
             a >= 0 ? packs[a].name : "-", w0v,
             b >= 0 ? packs[b].name : "-", w1v,
             gg >= 0 ? packs[gg].name : "-", w2v);
+        if (rec_trace) {                     // TOPA_REC: every rung's weight
+            fprintf(rec_trace, "%d %d %.4f %.9g %.9g %.9g slots=%s:%.4f,%s:%.4f,%s:%.4f,%s:%.4f w=",
+                    rec_frame_n, fly_active, fly_active == 1 ? fly_t / fly_T : 0.0,
+                    cam_h, cam_x, cam_y,
+                    a >= 0 ? packs[a].name : "-", w0v, b >= 0 ? packs[b].name : "-", w1v,
+                    gg >= 0 ? packs[gg].name : "-", w2v,
+                    cont >= 0 ? packs[cont].name : "-", w3v);
+            for (int k = 0; k < nslw; k++)
+                fprintf(rec_trace, "%s%s:%.4f", k ? "," : "", packs[idxw[k]].name, wsl[k]);
+            fprintf(rec_trace, " fg=%.3f,%.3f,%.3f,%.3f\n", g_fg[0], g_fg[1], g_fg[2], g_fg[3]);
+            fflush(rec_trace);
+        }
     }
 
     // ---- view centre on the sphere (EVERY frame — there is only one
@@ -2375,16 +2753,38 @@ static void hud_line(float xf, float base, int w, int h) {
     }
 }
 
+// One shading scale for every slot of this frame's blend: the relief
+// baseline (4.8 texels, in mercator units), the relief gain (80 per metre
+// of the elevation range) and the contour-colour ramp (elevation floor and
+// range), each the weight-blend of the slots' own. At rest that is exactly
+// the pack's own look; mid-flight all slots shade the same ground the same
+// way, so hand-off zones don't show as brighter or flatter rectangles.
+static void shade_common(void) {
+    float wv[3] = { g_w0v, g_w1v, g_w2v };
+    double sw = 0.0, b = 0.0, gn = 0.0, lo = 0.0, rg = 0.0;
+    for (int i = 0; i < 3; i++) {
+        struct pack *p = s_slotpk[i] >= 0 ? &packs[s_slotpk[i]] : NULL;
+        if (!p || !p->gl_ok || wv[i] <= 0.0f) continue;
+        double r = p->elev_hi - p->elev_lo;
+        if (r < 1.0) r = 1.0;
+        b  += wv[i] * 4.8 * p->msy / (double)p->ter_h;
+        gn += wv[i] * 80.0 / r;
+        lo += wv[i] * p->elev_lo;
+        rg += wv[i] * r;
+        sw += wv[i];
+    }
+    if (sw <= 0.0) { glUniform4f(u_hs, 1e-3f, 0.01f, 0.0f, 4000.0f); return; }
+    glUniform4f(u_hs, (float)(b / sw), (float)(gn / sw), (float)(lo / sw), (float)(rg / sw));
+}
+
 // per-slot uniform + label-projection refresh for this frame
 static void set_slot_uniforms(int i) {
     struct pack *s = (s_slotpk[i] >= 0) ? &packs[s_slotpk[i]] : NULL;
     int okp = s && s->gl_ok;
     glActiveTexture(GL_TEXTURE0 + UNIT_TER[i]);
     glBindTexture(GL_TEXTURE_2D, okp ? s->ter_tex : ph_ter_tex);
-    glActiveTexture(GL_TEXTURE0 + UNIT_FEAT[i]);
-    glBindTexture(GL_TEXTURE_2D, okp ? s->feat_tex : ph_feat_tex);
-    glActiveTexture(GL_TEXTURE0 + UNIT_WAT[i]);
-    glBindTexture(GL_TEXTURE_2D, (okp && s->water_tex) ? s->water_tex : ph_wat_tex);
+    glActiveTexture(GL_TEXTURE0 + UNIT_FW[i]);
+    glBindTexture(GL_TEXTURE_2D, (okp && s->fw_tex) ? s->fw_tex : ph_fw_tex);
     glActiveTexture(GL_TEXTURE0);
     double hx = cam_h * g_ar * 0.5, hy = cam_h * 0.5;
     double cx = okp ? (cam_x - s->mx0) / s->msx : 0.5;
@@ -2425,7 +2825,7 @@ static void set_slot_uniforms(int i) {
 // included — baked collisions and limb foreshortening both resolve); the
 // keep/drop verdict is EASED per label (~0.22s) so arbitration flips
 // crossfade instead of popping.
-#define MAXCAND (2 * PKMAX)
+#define MAXCAND (3 * PKMAX)
 struct labc { int slot, k, keep;
               float x0, y0, x1, y1, a, pri, ox, oy, qw, qh; };
 static struct labc g_lc[MAXCAND];
@@ -2496,13 +2896,23 @@ static void collect_labels(int i, float wabs, int w, int h) {
     }
 }
 
+// slot i holds a pack no earlier slot holds (each pack inks once)
+static int slot_first(int i) {
+    if (s_slotpk[i] < 0) return 0;
+    for (int j = 0; j < i; j++) if (s_slotpk[j] == s_slotpk[i]) return 0;
+    return 1;
+}
+
 // `ease`: only the primary output advances the per-label gates — they are
 // per-pack state, and every output easing them would speed the fades up N x
 static void labels_frame(int w, int h, int ease) {
     g_lcn = 0;
     hud_layout(w, h);
-    collect_labels(0, g_w0v * g_lf0, w, h);
-    if (s_slotpk[1] != s_slotpk[0]) collect_labels(1, g_w1v * g_lf1, w, h);
+    // every slot inks (the coverage container can sit in slot 2 with real
+    // weight); a pack doubled into two slots is drawn once
+    float wsl3[3] = { g_w0v, g_w1v, g_w2v };
+    for (int i = 0; i < 3; i++)
+        if (slot_first(i)) collect_labels(i, wsl3[i] * g_lf[i], w, h);
     for (int a = 1; a < g_lcn; a++) {                // insertion sort by pri
         struct labc t = g_lc[a]; int b = a - 1;
         while (b >= 0 && g_lc[b].pri < t.pri) { g_lc[b+1] = g_lc[b]; b--; }
@@ -2524,19 +2934,24 @@ static void labels_frame(int w, int h, int ease) {
     }
     // ease every label's gate toward its verdict (uncollected labels -> 0)
     float ke = ease ? 1.0f - expf((float)(-g_mdt / 0.22)) : 0.0f;
-    unsigned char tgt[2][PKMAX] = {{0}};
+    unsigned char tgt[3][PKMAX] = {{0}};
     for (int a = 0; a < g_lcn; a++)
         if (g_lc[a].keep) tgt[g_lc[a].slot][g_lc[a].k] = 1;
-    for (int i = 0; i < 2; i++) {
-        if (s_slotpk[i] < 0) continue;
-        if (i == 1 && s_slotpk[1] == s_slotpk[0]) continue;
+    for (int i = 0; i < 3; i++) {
+        if (!slot_first(i)) continue;
         struct pack *s = &packs[s_slotpk[i]];
         for (int k = 0; k < s->n_lab && k < PKMAX; k++)
             s->lab_vis[k] += ((float)tgt[i][k] - s->lab_vis[k]) * ke;
     }
-    for (int i = 0; i < 2; i++) {                    // draw, batched per atlas
-        if (s_slotpk[i] < 0) continue;
-        if (i == 1 && s_slotpk[1] == s_slotpk[0]) continue;
+    // packs out of the slots fade their gates too: one coming back must
+    // not resume at the visibility it left with (its labels popped in)
+    for (int j = 0; ease && j < n_packs; j++) {
+        if (j == s_slotpk[0] || j == s_slotpk[1] || j == s_slotpk[2]) continue;
+        for (int k = 0; k < packs[j].n_lab && k < PKMAX; k++)
+            packs[j].lab_vis[k] -= packs[j].lab_vis[k] * ke;
+    }
+    for (int i = 0; i < 3; i++) {                    // draw, batched per atlas
+        if (!slot_first(i)) continue;
         struct pack *s = &packs[s_slotpk[i]];
         int bound = 0;
         for (int a = 0; a < g_lcn; a++) {
@@ -2599,6 +3014,46 @@ static void maybe_shot(int w, int h) {
     g_running = 0;
 }
 
+// TOPA_REC: write this frame (see g_rec)
+static void rec_capture(int w, int h, const char *name) {
+    static unsigned char *px = NULL, *row = NULL;
+    static size_t cap = 0;
+    if ((size_t)w * h * 4 > cap) {
+        cap = (size_t)w * h * 4;
+        px = realloc(px, cap);
+        row = realloc(row, (size_t)w * 3);
+    }
+    if (!px || !row) return;
+    char path[480];
+    snprintf(path, sizeof path, "%s/%s.ppm", rec_dir, name);
+    FILE *f = fopen(path, "wb");
+    if (!f) return;
+    glPixelStorei(GL_PACK_ALIGNMENT, 1);
+    glReadPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, px);
+    fprintf(f, "P6\n%d %d\n255\n", w, h);
+    for (int y = h - 1; y >= 0; y--) {
+        const unsigned char *s = px + (size_t)y * w * 4;
+        for (int x = 0; x < w; x++) memcpy(row + x * 3, s + x * 4, 3);
+        fwrite(row, 1, (size_t)w * 3, f);
+    }
+    fclose(f);
+}
+
+// TOPA_REC: start each listed flight once the camera has idled rec_hold
+// seconds, quit once the last one has landed and settled
+static void rec_schedule(void) {
+    if (rec_max > 0 && rec_frame_n >= rec_max) { g_running = 0; return; }
+    if (fly_active || pending_area[0]) { rec_was_flying = 1; rec_next = -1.0; return; }
+    if (rec_was_flying || rec_next < 0.0) { rec_was_flying = 0; rec_next = rec_t + rec_hold; }
+    if (rec_t < rec_next || !cam_init) return;
+    if (!rec_fly[0]) { g_running = 0; return; }
+    char *c = strchr(rec_fly, ',');
+    size_t n = c ? (size_t)(c - rec_fly) : strlen(rec_fly);
+    snprintf(pending_area, sizeof pending_area, "%.*s", (int)n, rec_fly);
+    memmove(rec_fly, c ? c + 1 : rec_fly + n, strlen(c ? c + 1 : rec_fly + n) + 1);
+    rec_was_flying = 1;
+}
+
 // Draw the current world state into the current surface (w x h pixels).
 // `primary` = the output whose geometry the world step used (the largest);
 // only it eases shared state.
@@ -2611,7 +3066,24 @@ void engine_render(int w, int h, int primary) {
     glUniform2f(u_fam, (float)g_fam_s, (float)g_fam_t);
     glUniform1f(u_cpu, g_cpu);
     glUniform1f(u_night, g_night);
-    glUniform3f(u_w, g_w0v, g_w1v, g_w2v);
+    glUniform4f(u_w, g_w0v, g_w1v, g_w2v, g_w3v);
+    shade_common();
+    glUniform4fv(u_fg, 1, g_fg);
+    glUniformMatrix4fv(u_fin, 1, GL_FALSE, g_fin);
+    glUniformMatrix4fv(u_sib, 1, GL_FALSE, g_sib);
+    {   // which slot bbox edges are on screen, eased in over 40 px of inset
+        double hx = cam_h * g_ar * 0.5, hy = cam_h * 0.5;
+        double vx0 = cam_x - hx, vy0 = cam_y - hy, vw = 2.0 * hx, vh = 2.0 * hy;
+        for (int i = 0; i < 4; i++) {
+            struct pack *p = s_slotpk[i] >= 0 ? &packs[s_slotpk[i]] : NULL;
+            if (!p || p->msx > 0.999) { glUniform4f(u_fe[i], 0.0f, 0.0f, 0.0f, 0.0f); continue; }
+            double in[4] = { (p->mx0 - vx0) / vw * w, (vx0 + vw - p->mx0 - p->msx) / vw * w,
+                             (p->my0 - vy0) / vh * h, (vy0 + vh - p->my0 - p->msy) / vh * h };
+            float fe[4];
+            for (int k = 0; k < 4; k++) fe[k] = (float)smooth01(in[k] / 40.0);
+            glUniform4fv(u_fe[i], 1, fe);
+        }
+    }
     // ortho sphere radius: centre ground scale == old planar mapping exactly
     g_radpx = (double)h / (cam_h * 2.0 * M_PI * cos(g_glat));
     glUniform1f(u_radpx, (float)g_radpx);
@@ -2623,11 +3095,11 @@ void engine_render(int w, int h, int primary) {
     double gav = (2.0 - garr) / 1.3;
     g_aurf = (float)smooth01(gav < 0.0 ? 0.0 : (gav > 1.0 ? 1.0 : gav));
     glUniform3f(u_aur, g_aurf, (float)ph_aur, cfg.aurora ? 1.0f : 0.0f);
-    glUniform3f(u_wrap,
-        (s_slotpk[0] >= 0 && packs[s_slotpk[0]].msx > 0.999) ? 1.0f : 0.0f,
-        (s_slotpk[1] >= 0 && packs[s_slotpk[1]].msx > 0.999) ? 1.0f : 0.0f,
-        (s_slotpk[2] >= 0 && packs[s_slotpk[2]].msx > 0.999) ? 1.0f : 0.0f);
-    for (int i = 0; i < 2; i++) {
+    float wrap[4];
+    for (int i = 0; i < 4; i++)
+        wrap[i] = (s_slotpk[i] >= 0 && packs[s_slotpk[i]].msx > 0.999) ? 1.0f : 0.0f;
+    glUniform4fv(u_wrap, 1, wrap);
+    for (int i = 0; i < 4; i++) {
         set_slot_uniforms(i);
         // contour scale + px-per-texel (needs this output's pixel height)
         struct pack *s = (s_slotpk[i] >= 0) ? &packs[s_slotpk[i]] : NULL;
@@ -2638,29 +3110,15 @@ void engine_render(int w, int h, int primary) {
             glUniform4f(u_ctr[i], 0.0f, 0.0f, 0.0f, 0.0f);
         }
     }
-    {   // guarantor slot: terrain-only uniforms
-        struct pack *s = (s_slotpk[2] >= 0) ? &packs[s_slotpk[2]] : NULL;
-        int okp = s && s->gl_ok;
-        glActiveTexture(GL_TEXTURE0 + UNIT_TER2);
-        glBindTexture(GL_TEXTURE_2D, okp ? s->ter_tex : ph_ter_tex);
-        glActiveTexture(GL_TEXTURE0);
-        double cx = okp ? (cam_x - s->mx0) / s->msx : 0.5;
-        double cy = okp ? 1.0 - (cam_y - s->my0) / s->msy : 0.5;
-        glUniform2f(u_texel2, okp ? 1.0f / (float)s->ter_w : 1.0f,
-                              okp ? 1.0f / (float)s->ter_h : 1.0f);
-        glUniform2f(u_tc2, (float)cx, (float)cy);
-        glUniform2f(u_ts2, okp ? (float)(1.0 / (2.0 * M_PI * s->msx)) : 0.0f,
-                           okp ? (float)(1.0 / (2.0 * M_PI * s->msy)) : 0.0f);
-        if (okp) {
-            glUniform4f(u_ctr2, s->elev_lo, s->elev_hi - s->elev_lo, 0.0f, 0.0f);
-        } else {
-            glUniform4f(u_ctr2, 0.0f, 1.0f, 0.0f, 0.0f);
-        }
-    }
     glBindBuffer(GL_ARRAY_BUFFER, vbo);
     glEnableVertexAttribArray(a_pos);
     glVertexAttribPointer(a_pos, 2, GL_FLOAT, GL_FALSE, 0, 0);
     glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+    if (primary && g_rec && rec_dbg > 0 && rec_frame_n % rec_dbg == 0) {
+        char nm[32];                         // TOPA_REC_DBG: the map before labels
+        snprintf(nm, sizeof nm, "g%05d", rec_frame_n);
+        rec_capture(w, h, nm);
+    }
 
     // ---- labels: the ladder pair, weighted by the crossfade ----------------
     if (cam_init && cfg.labels) {
@@ -2769,6 +3227,25 @@ void engine_render(int w, int h, int primary) {
         glUseProgram(prog);
     }
     if (primary) maybe_shot(w, h);
+    if (primary && g_rec) {
+        char nm[32];
+        snprintf(nm, sizeof nm, "f%05d", rec_frame_n);
+        rec_capture(w, h, nm);
+        if (rec_dbg > 0 && rec_frame_n % rec_dbg == 0) {
+            // the slot shares, then each slot's colour alone (same frame)
+            glBindBuffer(GL_ARRAY_BUFFER, vbo);
+            glEnableVertexAttribArray(a_pos);
+            glVertexAttribPointer(a_pos, 2, GL_FLOAT, GL_FALSE, 0, 0);
+            for (int d = 1; d <= 5; d++) {
+                glUniform1f(u_dbg, (float)d);
+                glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+                snprintf(nm, sizeof nm, "d%05d_%d", rec_frame_n, d);
+                rec_capture(w, h, nm);
+            }
+            glUniform1f(u_dbg, 0.0f);
+        }
+        rec_frame_n++;
+    }
 }
 
 
@@ -2789,7 +3266,7 @@ static double frame_min_dt(void) {
 }
 
 double engine_now(void) { return now_sec(); }
-double engine_next_frame(void) { return t_prev + frame_min_dt(); }
+double engine_next_frame(void) { return g_rec ? now_sec() : t_prev + frame_min_dt(); }
 int    engine_layer_background(void) { return cfg.layer_background; }
 
 void engine_poll(void) {
@@ -2807,6 +3284,7 @@ void engine_poll(void) {
 void engine_step(int w, int h) {
     g_ar = (double)w / (double)(h > 0 ? h : 1);
     g_scr_h = h;
+    if (g_rec) { rec_t += rec_dt; rec_schedule(); }
 
     // deferred pack work (needs the GL context current)
     theme_apply();
@@ -2817,7 +3295,7 @@ void engine_step(int w, int h) {
         if (p_cur >= 0 && ensure_pack_gl(p_cur)) {
             idle_cam(p_cur, &cam_x, &cam_y, &cam_h);
             s_slotpk[0] = s_slotpk[1] = p_cur;
-            s_slotpk[2] = -1;
+            s_slotpk[2] = s_slotpk[3] = -1;
             cam_init = 1;
             chip_next = 0.0;
             fprintf(stderr, "topopaper: camera at '%s'\n", packs[p_cur].name);
@@ -2829,12 +3307,13 @@ void engine_step(int w, int h) {
     }
     if (pending_area[0] && !fly_active && cam_init) {
         int tgt = find_pack(pending_area);
-        if (tgt >= 0 && tgt != p_cur && ensure_pack_gl(tgt)) start_flight(tgt);
+        if (tgt >= 0 && tgt != p_cur && pack_stream(tgt, 0) >= 0) start_flight(tgt);
         else if (tgt != p_cur)
             fprintf(stderr, "topopaper: no such area '%s' (yet)\n", pending_area);
         pending_area[0] = '\0';
     }
 
+    stream_tick();
     step_world();
     sun_update();                            // live sun follows the camera
     if (!cfg.labels)                         // labels re-enabled later fade in
@@ -2902,6 +3381,20 @@ static void resolve_paths(void) {
 void engine_setup(void) {
     install_signals();
     t_start = mono_sec();
+    const char *rd = getenv("TOPA_REC");
+    if (rd && *rd) {
+        g_rec = 1;
+        snprintf(rec_dir, sizeof rec_dir, "%s", rd);
+        const char *v = getenv("TOPA_REC_FLY");
+        snprintf(rec_fly, sizeof rec_fly, "%s", v ? v : "");
+        if ((v = getenv("TOPA_REC_FPS")) && atof(v) > 0.0) rec_dt = 1.0 / atof(v);
+        if ((v = getenv("TOPA_REC_HOLD")) && atof(v) >= 0.0) rec_hold = atof(v);
+        if ((v = getenv("TOPA_REC_DBG"))) rec_dbg = atoi(v);
+        if ((v = getenv("TOPA_REC_FRAMES"))) rec_max = atoi(v);
+        char tp[480];
+        snprintf(tp, sizeof tp, "%s/trace.txt", rec_dir);
+        rec_trace = fopen(tp, "w");
+    }
     srand((unsigned)(time(NULL) ^ getpid()));
     resolve_paths();
     cfg_poll(0);
