@@ -7,6 +7,9 @@ import pytest  # noqa: E402
 
 from topopaper import autostart  # noqa: E402
 
+# compositor config files: Linux (Path.home() ignores $HOME on Windows)
+pytestmark = pytest.mark.skipif(sys.platform == "win32", reason="Linux compositors")
+
 EXE = "/opt/tp/bin/topopaper-session"
 CTL = "/opt/tp/bin/topopaper-ctl"
 SYSTEMCTL = []
@@ -165,6 +168,7 @@ def test_key_conversion():
 
 def test_compositor_detection(monkeypatch):
     monkeypatch.delenv("TOPOPAPER_COMPOSITOR", raising=False)
+    monkeypatch.setattr(autostart.system, "LINUX", True)    # elsewhere "other" is the OS
     assert autostart.compositor({"XDG_CURRENT_DESKTOP": "sway"}) == "sway"
     assert autostart.compositor({"XDG_CURRENT_DESKTOP": "Hyprland"}) == "hyprland"
     assert autostart.compositor({"XDG_CURRENT_DESKTOP": "niri"}) == "niri"

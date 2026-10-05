@@ -1,0 +1,5 @@
+// topopaper.exe resources: the application manifest (topopaper.manifest)
+// and the app icon
+#include <winuser.h>
+CREATEPROCESS_MANIFEST_RESOURCE_ID RT_MANIFEST "topopaper.manifest"
+1 ICON "../data/icons/topopaper.ico"

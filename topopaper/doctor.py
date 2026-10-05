@@ -13,7 +13,7 @@ import sys
 import tempfile
 import urllib.parse
 
-from . import paths, util
+from . import paths, system, util
 
 HOSTS = [
     ("tiles", "https://s3.amazonaws.com/elevation-tiles-prod/terrarium/0/0/0.png",
@@ -83,12 +83,36 @@ def c_layer_shell():
                  "topopaper can't draw a wallpaper on this compositor")
 
 
+def c_desktop():
+    """Windows and macOS: the OS version the engine's window tricks need."""
+    import platform
+    if system.WINDOWS:
+        build = sys.getwindowsversion().build
+        if build < 10240:
+            return check("desktop", "Windows", "fail", f"build {build}", "topopaper needs Windows 10 or 11")
+        import ctypes
+        shell = ctypes.windll.user32.FindWindowW("Progman", None)
+        detail = f"Windows {'11' if build >= 22000 else '10'} (build {build})"
+        if not shell:
+            return check("desktop", "Windows", "warn", detail + ", no Explorer desktop",
+                         "without Explorer the wallpaper is a plain bottom window")
+        return check("desktop", "Windows", "ok", detail)
+    ver = platform.mac_ver()[0]
+    try:
+        ok = tuple(int(x) for x in ver.split(".")[:2]) >= (10, 15)
+    except ValueError:
+        ok = True
+    return check("desktop", "macOS", "ok" if ok else "fail", ver or "unknown",
+                 "" if ok else "topopaper needs macOS 10.15 or newer")
+
+
 def c_engine():
     from . import session
     e = session.find_engine()
     if e:
         return check("engine", "Wallpaper engine", "ok", e)
     return check("engine", "Wallpaper engine", "fail", "the `topopaper` binary was not found",
+                 "run install.ps1 again" if system.WINDOWS else
                  "run `make` (source checkout) or `make install`")
 
 
@@ -110,12 +134,21 @@ def c_build_deps():
     ok, err = _try_import("import numpy, PIL")
     if ok:
         return check("build_deps", "Map builder (numpy, Pillow)", "ok", _python())
-    return check("build_deps", "Map builder (numpy, Pillow)", "fail", err,
-                 "install python numpy and pillow (e.g. pacman -S python-numpy python-pillow, "
-                 "apt install python3-numpy python3-pil)")
+    fix = ("install python numpy and pillow (e.g. pacman -S python-numpy python-pillow, "
+           "apt install python3-numpy python3-pil)")
+    if not system.LINUX:
+        fix = f"{_python()} -m pip install numpy pillow"
+    return check("build_deps", "Map builder (numpy, Pillow)", "fail", err, fix)
 
 
 def c_gui_deps():
+    if not system.LINUX:
+        ok, err = _try_import("import tkinter; tkinter.Tcl()")
+        if ok:
+            return check("gui_deps", "Settings window (Tk)", "ok")
+        return check("gui_deps", "Settings window (Tk)", "warn", err,
+                     "reinstall Python from python.org (Tk included)" if system.WINDOWS else
+                     "brew install python-tk (or use Python from python.org)")
     ok, err = _try_import("import gi; gi.require_version('Gtk', '4.0'); "
                           "gi.require_version('Adw', '1'); from gi.repository import Gtk, Adw")
     if ok:
@@ -171,7 +204,7 @@ def c_session():
     if session.is_running():
         return check("session", "Wallpaper running", "ok", f"session pid {session.read_pid()}")
     return check("session", "Wallpaper running", "warn", "no session",
-                 "run `topopaper-session &` or `topopaper-ctl restart`")
+                 "run `topopaper-ctl restart`")
 
 
 def c_autostart():
@@ -196,7 +229,8 @@ def c_host(id, url, what):
 
 def run_checks(offline=False):
     out = []
-    for fn in (c_wayland, c_compositor, c_layer_shell, c_engine, c_build_deps, c_gui_deps,
+    desktop = (c_wayland, c_compositor, c_layer_shell) if system.LINUX else (c_desktop,)
+    for fn in (*desktop, c_engine, c_build_deps, c_gui_deps,
                c_font, c_earth, c_packs_writable, c_config, c_session, c_autostart):
         try:
             out.append(fn())

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Remove topopaper.
+# Remove topopaper (Linux and macOS; Windows: uninstall.ps1).
 #
 #   ./uninstall.sh                 remove the program; keep your maps and settings
 #   ./uninstall.sh --purge         also delete maps, settings, caches and logs
@@ -34,6 +34,7 @@ for f in bin/topopaper bin/topopaper-ctl bin/topopaper-session bin/topopaper-set
     run rm -f "$PREFIX/$f"
 done
 run rm -rf "$PREFIX/share/topopaper"
+[ "$(uname -s)" = Darwin ] && rm -rf "$HOME/Applications/Topopaper.app"
 echo "topopaper removed from $PREFIX"
 
 data="${XDG_DATA_HOME:-$HOME/.local/share}/topopaper"
@@ -42,6 +43,7 @@ if [ "$PURGE" = 1 ]; then
            "${XDG_CONFIG_HOME:-$HOME/.config}/topopaper" \
            "${XDG_STATE_HOME:-$HOME/.local/state}/topopaper" \
            "${XDG_CACHE_HOME:-$HOME/.cache}/topopaper"
+    [ "$(uname -s)" = Darwin ] && rm -rf "$HOME/Library/Caches/topopaper"
     echo "maps, settings, caches and logs deleted"
 else
     echo "kept your maps and settings ($data, ~/.config/topopaper); --purge deletes them"

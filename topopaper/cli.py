@@ -1,12 +1,11 @@
 """topopaper-ctl: one entry point for everything outside the engine."""
 import importlib
 import json
-import os
 import shutil
 import subprocess
 import sys
 
-from . import __version__, config, paths, util
+from . import __version__, config, paths, system, util
 
 # command -> (module, function, one-line help). Modules load lazily so a
 # plain `fly` never imports numpy, and so optional parts can fail alone.
@@ -52,21 +51,12 @@ def cmd_fly(argv):
     return 0
 
 
-def engine_running():
-    try:
-        r = subprocess.run(["pgrep", "-u", str(os.getuid()), "-x", "topopaper"],
-                           capture_output=True, check=False)
-        return r.returncode == 0
-    except OSError:
-        return False
-
-
 def cmd_status(argv):
     packs = util.list_packs()
     size = sum(util.pack_size(n) for n, _ in packs)
     info = {
         "version": __version__,
-        "engine_running": engine_running(),
+        "engine_running": system.engine_running(),
         "current_area": util.current_area(),
         "packs": len(packs),
         "packs_mb": round(size / 1e6, 1),
@@ -111,13 +101,13 @@ def cmd_config(argv):
 
 
 def open_settings(page=None):
-    exe = shutil.which("topopaper-settings")
-    cmd = [exe] if exe else [sys.executable, "-m", "topopaper.settings"]
+    exe = None if system.WINDOWS else shutil.which("topopaper-settings")
+    cmd = [exe] if exe else [system.gui_python(), "-m", "topopaper.settings"]
     if page:
         cmd += ["--page", page]
     _, env = util.ctl_cmd()
-    subprocess.Popen(cmd, env=env, start_new_session=True,
-                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    subprocess.Popen(cmd, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                     **system.detached())
     return 0
 
 

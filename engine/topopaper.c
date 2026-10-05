@@ -1,6 +1,6 @@
-// topopaper — real-time GLSL topographic wallpaper for Wayland compositors
-// with wlr-layer-shell (sway, Hyprland, river, ...). A layer-shell
-// client (click-through, one surface per selected output) rendering a living
+// topopaper — real-time GLSL topographic wallpaper: a click-through surface
+// per display (layer-shell on Wayland, behind the desktop icons on Windows,
+// at desktop level on macOS; see platform.h) rendering a living
 // ATLAS of real terrain, from the whole planet down to a single ski hill. CPU
 // load bends the motion speed and warms the contour lines; the real sun
 // lights the globe and dims the night side.
@@ -61,58 +61,28 @@
 // Build: `make` (build/topopaper); `make install` puts it on the PATH.
 // Debug env: TOPA_SUN_T=<epoch> pins the sun, TOPA_DEBUG=1 traces the camera
 // per frame, TOPA_NOHUD=1 drops the HUD, TOPA_POWER_DIR fakes the sysfs
-// power_supply tree.
-#include <EGL/egl.h>
-#include <EGL/eglext.h>
-#include <GLES2/gl2.h>
-#include <wayland-client.h>
-#include <wayland-egl.h>
-#include "wlr-layer-shell-client-protocol.h"
+// power_supply tree, TOPA_SHOT=<file.ppm> saves the first display's frame
+// after TOPA_SHOT_T seconds (default 8) and exits.
+#include "platform.h"
 #include "themes.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
 #include <time.h>
-#include <signal.h>
+#include <limits.h>
 #include <sys/stat.h>
 #include <unistd.h>
 #include <dirent.h>
-#include <poll.h>
-#include <errno.h>
-
 #include <strings.h>
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
 
-// ---- Wayland globals -------------------------------------------------------
-static struct wl_display    *display;
-static struct wl_compositor *compositor;
-static struct zwlr_layer_shell_v1 *layer_shell;
-static EGLDisplay egl_display;
-static EGLConfig  egl_config;
-static EGLContext egl_context = EGL_NO_CONTEXT;
-
-// One per wl_output global. The surface exists only while the output is
-// selected (cfg.outputs) and the compositor hasn't closed it; outputs come
-// and go at runtime (hotplug), and a settings change re-evaluates the set.
-struct output {
-    struct wl_output *wl_output;
-    uint32_t global, version;       // registry name (global_remove) + bound version
-    char     name[64];              // wl_output v4 name event ("" before v4)
-    int      ready;                 // first done event seen: name + scale known
-    int      closed;                // compositor closed our layer surface
-    int      layer;                 // cfg.layer_background the surface was made with
-    int      configured;            // first configure acked, EGL surface live
-    struct wl_surface *surface;
-    struct zwlr_layer_surface_v1 *layer_surface;
-    struct wl_egl_window *egl_window;
-    EGLSurface egl_surface;
-    struct wl_callback *frame_cb;   // non-NULL: a frame is in flight
-    int32_t width, height, scale, buf_scale;
-    struct output *next;
-};
-static struct output *outputs;      // simple linked list
-static int g_wl_ready = 0;          // initial roundtrips done: surfaces may be made
-static int g_out_dirty = 0;         // re-run output selection in the main loop
+volatile sig_atomic_t g_running = 1, g_hup = 0;
+int g_out_dirty = 0;                // re-run output selection in the main loop
+int g_out_retry = 0;                // a deliberate change: retry closed outputs
+int g_covered_src = -1;             // backends that see occlusion themselves set 0/1
 
 // ---- area pack registry + scale ladder -------------------------------------
 #define PKMAX 24
@@ -174,7 +144,7 @@ static GLint la_pos, lu_rect, lu_uv, lu_alpha;
 // theme palette uniforms (main, label and city-light programs)
 static GLint u_th[12], lu_ink = -1, lu_halo = -1, ltu_city = -1;
 static int   g_theme = 0, g_theme_gen = -1;   // theme_rgb row + cfg_gen applied
-static struct timespec t_start;
+static double t_start;
 
 // ---- world state (integrated phases + smoothed values) ---------------------
 static double t_prev = 0.0;
@@ -195,7 +165,7 @@ static float  g_aurf = 0.0f;                // globe-scale factor for aurora/lig
 static float  g_snow = 99999.0f, g_snow_t = 99999.0f;  // snowline metres (eased)
 static int    g_on_battery = 0;
 static int    g_covered = 0;
-static char   covered_path[256];
+static char   covered_path[512];
 static double last_sys = -1.0, scan_next = 0.0;
 static double areas_mtime = -2.0;           // areas dir mtime at the last rescan
 static int    scan_pending = 0;             // pack dirs not settled yet: rescan again
@@ -211,7 +181,7 @@ static char  area_seen[64] = "";            // last area-file word acted on
 // $XDG_RUNTIME_DIR/topopaper-progress.bin: 'TOPOPRG1' | u16 w,h | (L,A) bytes.
 // Present + fresh -> fade a label-styled quad in bottom-left; the builder
 // heartbeats mtime through long network backoffs and unlinks when done.
-static char   progress_path[256];
+static char   progress_path[512];
 static GLuint g_prog_tex = 0;
 static int    g_prog_w = 0, g_prog_h = 0;
 static double g_prog_mseen = 0.0;
@@ -228,6 +198,7 @@ static float  g_prog_vis = 0.0f, g_prog_a = 0.0f;
 static char   hud_path[512];
 static char   tz_path[512];                 // location.json (clock timezone)
 static char   g_tz_cur[64] = "";
+static long   g_tz_off = LONG_MIN;
 static double tz_next_check = 0.0;
 static char   wx_path[512];                 // weather.txt (HUD weather rows)
 static char   wx_cur[40] = "", wx_prev[40] = "";
@@ -375,8 +346,7 @@ static void cfg_load(void) {
 static void cfg_poll(int force) {
     static char out_applied[256] = "\x01";
     static int  layer_applied = -1;
-    struct stat st;
-    double m = stat(cfg_path, &st) == 0 ? (double)st.st_mtime + st.st_mtim.tv_nsec / 1e9 : -1.0;
+    double m = path_mtime(cfg_path);
     if (m == cfg_mtime && !force) return;
     cfg_mtime = m;
     cfg_load();
@@ -385,7 +355,7 @@ static void cfg_poll(int force) {
     if (strcmp(out_applied, cfg.outputs) || layer_applied != cfg.layer_background) {
         if (out_applied[0] != '\x01') {
             // a deliberate change: outputs the compositor closed get a new try
-            for (struct output *o = outputs; o; o = o->next) o->closed = 0;
+            g_out_retry = 1;
         }
         snprintf(out_applied, sizeof out_applied, "%s", cfg.outputs);
         layer_applied = cfg.layer_background;
@@ -393,10 +363,7 @@ static void cfg_poll(int force) {
     }
 }
 
-static double now_sec(void) {
-    struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
-    return (t.tv_sec - t_start.tv_sec) + (t.tv_nsec - t_start.tv_nsec) / 1e9;
-}
+static double now_sec(void) { return mono_sec() - t_start; }
 static double smooth01(double x) {           // smoothstep
     if (x < 0) x = 0;
     if (x > 1) x = 1;
@@ -463,10 +430,7 @@ static void read_area_request(void) {
 }
 
 // ---- pack registry (metas on (re)scan; textures on demand) -----------------
-static double file_mtime(const char *path) {
-    struct stat st;
-    return stat(path, &st) == 0 ? (double)st.st_mtime + st.st_mtim.tv_nsec / 1e9 : -1.0;
-}
+static double file_mtime(const char *path) { return path_mtime(path); }
 
 // Fills the meta fields only: a pack rebuilt in place keeps its texture
 // names until the next tick frees and re-uploads them (stale).
@@ -484,8 +448,7 @@ static int pack_read_meta(struct pack *p, const char *name) {
     fclose(f);
     if (!ok) { fprintf(stderr, "topopaper: bad meta.bin for '%s'\n", name); return 0; }
     snprintf(path, sizeof path, "%s/%s/terrain.bin", areas_dir, name);
-    struct stat st;
-    if (stat(path, &st) != 0) return 0;
+    if (!path_exists(path)) return 0;
     snprintf(p->name, sizeof p->name, "%s", name);
     p->mx0 = geo[0]; p->my0 = geo[1]; p->msx = geo[2]; p->msy = geo[3];
     memcpy(p->tzname, tzn, 32); p->tzname[32] = 0;
@@ -704,10 +667,15 @@ static void hud_tz_sync(double t) {
     char *e = strchr(k + 1, '"');
     if (!e || e == k + 1 || e - k >= (long)sizeof g_tz_cur) return;
     char tz[64]; memcpy(tz, k + 1, (size_t)(e - k - 1)); tz[e - k - 1] = 0;
-    if (strcmp(tz, g_tz_cur)) {
+    long off = LONG_MIN;                     // "utc_offset" (s): for C runtimes without IANA
+    char *u = strstr(buf, "\"utc_offset\"");
+    if (u && (u = strchr(u, ':'))) off = strtol(u + 1, NULL, 10);
+    if (strcmp(tz, g_tz_cur) || off != g_tz_off) {
+        if (strcmp(tz, g_tz_cur))
+            fprintf(stderr, "topopaper: clock timezone -> %s\n", tz);
         snprintf(g_tz_cur, sizeof g_tz_cur, "%s", tz);
-        setenv("TZ", tz, 1); tzset();
-        fprintf(stderr, "topopaper: clock timezone -> %s\n", tz);
+        g_tz_off = off;
+        tz_use(tz, off);
     }
 }
 
@@ -804,20 +772,16 @@ static void hud_wx_sync(double t) {
 
 // The viewed pack's UTC offset in minutes: baked IANA tz name when the pack
 // carries one (quarter-hour zones + DST exact, via a cached TZ-swap once an
-// hour), longitude/15 solar estimate otherwise. Restores the engine's own
-// location-driven TZ afterwards.
+// hour), longitude/15 solar estimate otherwise (and where the C runtime
+// knows no IANA zones).
 static int pack_tz_minutes(struct pack *pp) {
     time_t now = time(NULL);
     if (pp->tzname[0]) {
         if (pp->tz_when && now - pp->tz_when < 3600) return pp->tz_min;
-        char save[128] = ""; const char *old = getenv("TZ");
-        if (old) snprintf(save, sizeof save, "%s", old);
-        setenv("TZ", pp->tzname, 1); tzset();
-        struct tm ptm; localtime_r(&now, &ptm);
-        pp->tz_min = (int)(ptm.tm_gmtoff / 60); pp->tz_when = now;
-        if (old) setenv("TZ", save, 1); else unsetenv("TZ");
-        tzset();
-        return pp->tz_min;
+        if (tz_offset_min(pp->tzname, now, &pp->tz_min)) {
+            pp->tz_when = now;
+            return pp->tz_min;
+        }
     }
     double plon = (pp->mx0 + 0.5 * pp->msx - 0.5) * 2.0 * M_PI;
     return (int)floor(plon * 12.0 / M_PI + 0.5) * 60;
@@ -834,13 +798,12 @@ static void chip_sync(double t) {
         struct pack *pp = &packs[p_cur];
         int offm = pack_tz_minutes(pp);
         time_t nowt = time(NULL);
-        struct tm lo; localtime_r(&nowt, &lo);
-        int dd = offm - (int)(lo.tm_gmtoff / 60);
+        int dd = offm - local_offset_min(nowt);
         if (dd > 720) dd -= 1440;
         if (dd < -720) dd += 1440;
         if (dd >= 180 || dd <= -180) {
             time_t pt = nowt + (time_t)offm * 60;
-            struct tm pm; gmtime_r(&pt, &pm);
+            struct tm pm; utc_tm(pt, &pm);
             int h12 = pm.tm_hour % 12; if (!h12) h12 = 12;
             char nm[20]; int i = 0;
             for (const char *s = pp->name; *s && i < 16; s++) {
@@ -1203,73 +1166,30 @@ static void maybe_roam(double dt) {
 }
 
 // ---- power source ------------------------------------------------------------
-// On battery = the machine has a system battery and no adapter is online
-// (type Mains or USB, online=1). Without any adapter entry, fall back to the
-// battery reporting Discharging. Peripheral batteries (mice, headsets:
-// scope=Device) are ignored; a desktop with no battery is never on battery.
-static int sysfs_word(const char *dir, const char *name, char *out, size_t n) {
-    char path[512];
-    snprintf(path, sizeof path, "%s/%s", dir, name);
-    FILE *f = fopen(path, "r");
-    out[0] = 0;
-    if (!f) return 0;
-    int ok = fgets(out, (int)n, f) != NULL;
-    fclose(f);
-    char *e = strchr(out, '\n'); if (e) *e = 0;
-    return ok;
-}
-
+// compat.c's on_battery() decides (sysfs, IOKit or GetSystemPowerStatus).
 static void power_scan(void) {
-    const char *base = getenv("TOPA_POWER_DIR");     // rigs: a fake sysfs tree
-    if (!base || !*base) base = "/sys/class/power_supply";
-    DIR *d = opendir(base);
-    if (!d) { g_on_battery = 0; return; }
-    int bat = 0, dis = 0, ac = 0, ac_on = 0;
-    struct dirent *e;
-    char dir[400], v[32];
-    while ((e = readdir(d))) {
-        if (e->d_name[0] == '.') continue;
-        snprintf(dir, sizeof dir, "%s/%s", base, e->d_name);
-        if (sysfs_word(dir, "scope", v, sizeof v) && !strcmp(v, "Device")) continue;
-        if (!sysfs_word(dir, "type", v, sizeof v)) continue;
-        if (!strcmp(v, "Battery")) {
-            bat = 1;
-            if (sysfs_word(dir, "status", v, sizeof v) && !strcmp(v, "Discharging")) dis = 1;
-        } else if (!strcmp(v, "Mains") || !strcmp(v, "USB")) {
-            ac = 1;
-            if (sysfs_word(dir, "online", v, sizeof v) && v[0] == '1') ac_on = 1;
-        }
-    }
-    closedir(d);
-    int ob = bat && (ac ? !ac_on : dis);
+    int ob = on_battery();
     if (ob != g_on_battery)
         fprintf(stderr, "topopaper: power -> %s\n", ob ? "battery" : "AC");
     g_on_battery = ob;
 }
 
-// Update raw targets ~2.5x/sec (cheap /proc + localtime reads). Runs from
+// Update raw targets ~2.5x/sec (cheap CPU-time + file reads). Runs from
 // the main loop whether or not anything is drawn, so settings and fly
 // requests are seen even with every output deselected.
 static void update_targets(double now) {
     if (last_sys >= 0 && now - last_sys < 0.4) return;
     last_sys = now;
-    FILE *f = fopen("/proc/stat", "r");
-    if (f) {
-        unsigned long long u,n,s,i,io,irq,sirq,st;
-        if (fscanf(f, "cpu %llu %llu %llu %llu %llu %llu %llu %llu",
-                   &u,&n,&s,&i,&io,&irq,&sirq,&st) >= 4) {
-            unsigned long long idle = i + io;
-            unsigned long long total = u+n+s+i+io+irq+sirq+st;
-            unsigned long long di = idle - cpu_prev_idle, dt = total - cpu_prev_total;
-            if (cpu_prev_total && dt) {
-                float cpu = 1.0f - (float)di / (float)dt;
-                if (cpu < 0.0f) cpu = 0.0f;
-                if (cpu > 1.0f) cpu = 1.0f;
-                cpu_target = cpu;
-            }
-            cpu_prev_idle = idle; cpu_prev_total = total;
+    unsigned long long idle, total;
+    if (cpu_times(&idle, &total)) {
+        unsigned long long di = idle - cpu_prev_idle, dt = total - cpu_prev_total;
+        if (cpu_prev_total && dt) {
+            float cpu = 1.0f - (float)di / (float)dt;
+            if (cpu < 0.0f) cpu = 0.0f;
+            if (cpu > 1.0f) cpu = 1.0f;
+            cpu_target = cpu;
         }
-        fclose(f);
+        cpu_prev_idle = idle; cpu_prev_total = total;
     }
     cfg_poll(0);
     if (!cfg.react_to_cpu) cpu_target = 0.0f;   // g_cpu glides out: no boost, no tint
@@ -1289,18 +1209,19 @@ static void update_targets(double now) {
         }
         power_scan();
     }
-    FILE *cf = fopen(covered_path, "r");    // written by the compositor watcher
-    if (cf) {
+    FILE *cf = g_covered_src >= 0 ? NULL : fopen(covered_path, "r");  // the watcher's
+    if (g_covered_src >= 0) {
+        g_covered = g_covered_src;           // the backend sees occlusion itself
+    } else if (cf) {
         int ch = fgetc(cf);
         g_covered = (ch == '1');
         fclose(cf);
     } else {
         g_covered = 0;                       // no watcher: never assume covered
     }
-    struct stat pst;                        // download meter presence + updates
-    if (stat(progress_path, &pst) == 0 &&
-        difftime(time(NULL), pst.st_mtime) < 45.0) {
-        double m = (double)pst.st_mtime;
+    double pm = path_mtime(progress_path);  // download meter presence + updates
+    if (pm >= 0.0 && difftime(time(NULL), (time_t)pm) < 45.0) {
+        double m = floor(pm);
         if (m != g_prog_mseen) { g_prog_mseen = m; g_prog_dirty = 1; }
         g_prog_vis = 1.0f;
     } else {
@@ -1714,16 +1635,51 @@ static const char *FRAG_L =
     "  gl_FragColor = vec4(c, t.a*uAlpha);\n"
     "}\n";
 
+// The shaders are GLSL ES 1.00. Desktop GL (Windows, macOS) compiles them as
+// GLSL 1.20: the same language once the precision statements and the
+// derivatives extension (core there) are dropped and the qualifiers defined
+// away.
 static GLuint compile(GLenum type, const char *src) {
     GLuint s = glCreateShader(type);
+#ifdef TOPA_DESKTOP_GL
+    size_t n = strlen(src);
+    char *d = malloc(n + 128), *o = d;
+    o += sprintf(o, "#version 120\n#define lowp\n#define mediump\n#define highp\n");
+    for (const char *l = src; *l; ) {
+        const char *e = strchr(l, '\n');
+        size_t len = e ? (size_t)(e - l + 1) : strlen(l);
+        if (strncmp(l, "precision ", 10) && strncmp(l, "#extension", 10)) {
+            memcpy(o, l, len); o += len;
+        }
+        l += len;
+    }
+    *o = 0;
+    const char *dsrc = d;
+    glShaderSource(s, 1, &dsrc, NULL); glCompileShader(s);
+    free(d);
+#else
     glShaderSource(s, 1, &src, NULL); glCompileShader(s);
+#endif
     GLint ok; glGetShaderiv(s, GL_COMPILE_STATUS, &ok);
     if (!ok) { char log[4096]; glGetShaderInfoLog(s, 4096, NULL, log);
                fprintf(stderr, "topopaper: shader compile failed:\n%s\n", log); exit(1); }
     return s;
 }
 
-static void gl_init(void) {
+// Per-context state. Programs, buffers and textures are shared between the
+// contexts of a backend that needs one per display (macOS); this is the rest.
+void engine_gl_context(void) {
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+#ifdef TOPA_DESKTOP_GL
+    glEnable(0x8642);                       // GL_VERTEX_PROGRAM_POINT_SIZE: gl_PointSize
+    glEnable(0x8861);                       // GL_POINT_SPRITE: gl_PointCoord (GL 2.1)
+#endif
+}
+
+void engine_gl_init(void) {
+    fprintf(stderr, "topopaper: GL %s (%s)\n", (const char *)glGetString(GL_VERSION),
+            (const char *)glGetString(GL_RENDERER));
+    engine_gl_context();
     GLuint v = compile(GL_VERTEX_SHADER, VERT), fsh = compile(GL_FRAGMENT_SHADER, FRAG);
     prog = glCreateProgram();
     glAttachShader(prog, v); glAttachShader(prog, fsh); glLinkProgram(prog);
@@ -1776,7 +1732,6 @@ static void gl_init(void) {
     glUniform1i(glGetUniformLocation(prog, "uFeat1"), UNIT_FEAT[1]);
     glUniform1i(glGetUniformLocation(prog, "uWat0"),  UNIT_WAT[0]);
     glUniform1i(glGetUniformLocation(prog, "uWat1"),  UNIT_WAT[1]);
-    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
     unsigned char flat[2] = {0, 0}, far2[2] = {255, 255}, dry[1] = {255};
     glGenTextures(1, &ph_ter_tex);
     glGenTextures(1, &ph_feat_tex);
@@ -1956,7 +1911,7 @@ static void step_world(void) {
         chip_sync(t);
         g_wx_vis += ((g_wx_want ? 1.0f : 0.0f) - g_wx_vis)
                     * (float)(1.0 - exp(-mdt / 1.2));
-        time_t wt = time(NULL); struct tm lt; localtime_r(&wt, &lt);
+        time_t wt = time(NULL); struct tm lt; local_tm(wt, &lt);
         int h12 = lt.tm_hour % 12; if (!h12) h12 = 12;
         char ns[8];
         if (g_hud_24) snprintf(ns, sizeof ns, "%02d:%02d", lt.tm_hour, lt.tm_min);
@@ -2205,7 +2160,6 @@ static void step_world(void) {
     g_glat = glat;
 }
 
-static const struct wl_callback_listener frame_listener;
 
 // ---- HUD layout: ONE geometry truth ---------------------------------------
 // The draw (hud_line + the weather rows) and the label occlusion both read
@@ -2619,12 +2573,37 @@ static void label_pass_begin(void) {
     glVertexAttribPointer(la_pos, 2, GL_FLOAT, GL_FALSE, 0, 0);
 }
 
-// Draw the current world state into one output. `primary` = the output whose
-// geometry the world step used (the largest); only it eases shared state.
-static void render(struct output *o, int primary) {
-    int w = o->width * o->scale, h = o->height * o->scale;
+// TOPA_SHOT=<file.ppm>: write the primary display's frame once TOPA_SHOT_T
+// seconds have passed, then quit (CI renders on every platform with it).
+static void maybe_shot(int w, int h) {
+    static double due = -1.0;
+    const char *path = getenv("TOPA_SHOT");
+    if (!path || !*path) return;
+    if (due < 0.0) {
+        const char *t = getenv("TOPA_SHOT_T");
+        due = t ? atof(t) : 8.0;
+    }
+    if (now_sec() < due || !g_running) return;
+    unsigned char *px = malloc((size_t)w * h * 4);
+    FILE *f = px ? fopen(path, "wb") : NULL;
+    if (f) {
+        glPixelStorei(GL_PACK_ALIGNMENT, 1);
+        glReadPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, px);
+        fprintf(f, "P6\n%d %d\n255\n", w, h);
+        for (int y = h - 1; y >= 0; y--)
+            for (int x = 0; x < w; x++) fwrite(px + ((size_t)y * w + x) * 4, 1, 3, f);
+        fclose(f);
+        fprintf(stderr, "topopaper: wrote %s (%dx%d)\n", path, w, h);
+    }
+    free(px);
+    g_running = 0;
+}
+
+// Draw the current world state into the current surface (w x h pixels).
+// `primary` = the output whose geometry the world step used (the largest);
+// only it eases shared state.
+void engine_render(int w, int h, int primary) {
     if (w <= 0 || h <= 0) return;
-    if (!eglMakeCurrent(egl_display, o->egl_surface, o->egl_surface, egl_context)) return;
     glViewport(0, 0, w, h);
     glUseProgram(prog);
     glUniform2f(u_res, (float)w, (float)h);
@@ -2789,19 +2768,11 @@ static void render(struct output *o, int primary) {
         glDisable(GL_BLEND);
         glUseProgram(prog);
     }
-    o->frame_cb = wl_surface_frame(o->surface);
-    wl_callback_add_listener(o->frame_cb, &frame_listener, o);
-    eglSwapBuffers(egl_display, o->egl_surface);
+    if (primary) maybe_shot(w, h);
 }
 
-// The compositor is ready for this output's next frame; the main loop draws
-// it on the next tick.
-static void frame_done(void *data, struct wl_callback *cb, uint32_t t) {
-    (void)t; struct output *o = data;
-    wl_callback_destroy(cb);
-    o->frame_cb = NULL;
-}
-static const struct wl_callback_listener frame_listener = { .done = frame_done };
+
+// ---- the API the backends drive (platform.h) ----------------------------------
 
 // Tiered frame-rate cap (config.ini): fps_covered while covered and paused;
 // flights (and their landing blend) at max(fps, 30) even on battery —
@@ -2817,25 +2788,25 @@ static double frame_min_dt(void) {
     return 1.0 / (double)(fps > 0 ? fps : 1);
 }
 
-// One frame tick: step the world ONCE, then draw it into every output whose
-// previous frame the compositor has released. Returns 0 (nothing done) when
-// no output is ready, so the world stays put while nothing can show it.
-static int frame_tick(void) {
-    struct output *first = NULL, *prim = NULL;
-    long best = -1;
-    for (struct output *o = outputs; o; o = o->next) {
-        if (!o->configured || o->egl_surface == EGL_NO_SURFACE) continue;
-        long px = (long)o->width * o->scale * (long)o->height * o->scale;
-        if (px > best) { best = px; prim = o; }
-        if (!o->frame_cb && !first) first = o;
+double engine_now(void) { return now_sec(); }
+double engine_next_frame(void) { return t_prev + frame_min_dt(); }
+int    engine_layer_background(void) { return cfg.layer_background; }
+
+void engine_poll(void) {
+    if (g_hup) { g_hup = 0; cfg_poll(1); }
+    if (parent_gone()) {
+        fprintf(stderr, "topopaper: the session is gone; exiting\n");
+        g_running = 0;
     }
-    if (!first) return 0;
-    if (!eglMakeCurrent(egl_display, first->egl_surface, first->egl_surface, egl_context))
-        return 0;
-    // the camera's aspect and the weight law's pixel height come from the
-    // largest output; every output then draws the same camera at its own size
-    g_ar = (double)prim->width / (double)(prim->height > 0 ? prim->height : 1);
-    g_scr_h = prim->height * prim->scale;
+    update_targets(now_sec());
+}
+
+// Advance the world once, with a GL context current. The camera's aspect and
+// the weight law's pixel height come from the largest display (w x h px);
+// every display then draws the same camera at its own size.
+void engine_step(int w, int h) {
+    g_ar = (double)w / (double)(h > 0 ? h : 1);
+    g_scr_h = h;
 
     // deferred pack work (needs the GL context current)
     theme_apply();
@@ -2868,345 +2839,76 @@ static int frame_tick(void) {
     sun_update();                            // live sun follows the camera
     if (!cfg.labels)                         // labels re-enabled later fade in
         for (int i = 0; i < n_packs; i++) memset(packs[i].lab_vis, 0, sizeof packs[i].lab_vis);
-    for (struct output *o = outputs; o; o = o->next)
-        if (o->configured && o->egl_surface != EGL_NO_SURFACE && !o->frame_cb)
-            render(o, o == prim || (prim->frame_cb && o == first));
-    return 1;
 }
 
-// ---- outputs: selection, surfaces, hotplug -----------------------------------
-// cfg.outputs is "all" or a comma-separated list of output names. Outputs
+// cfg.outputs is "all" or a comma-separated list of display names. Displays
 // without a name (compositors before wl_output v4) can't be matched, so they
 // are always drawn rather than never.
-static int output_selected(const struct output *o) {
+int engine_output_wanted(const char *name) {
     const char *s = cfg.outputs;
     while (*s == ' ') s++;
-    if (!*s || !strcasecmp(s, "all") || !o->name[0]) return 1;
+    if (!*s || !strcasecmp(s, "all") || !name[0]) return 1;
     char list[256];
     snprintf(list, sizeof list, "%s", cfg.outputs);
-    for (char *save = NULL, *t = strtok_r(list, ",", &save); t; t = strtok_r(NULL, ",", &save))
-        if (!strcmp(trim(t), o->name)) return 1;
+    for (char *t = strtok(list, ","); t; t = strtok(NULL, ","))
+        if (!strcmp(trim(t), name)) return 1;
     return 0;
 }
 
-static void destroy_surface(struct output *o) {
-    if (o->frame_cb) { wl_callback_destroy(o->frame_cb); o->frame_cb = NULL; }
-    if (o->egl_surface != EGL_NO_SURFACE) {
-        if (eglGetCurrentSurface(EGL_DRAW) == o->egl_surface)
-            eglMakeCurrent(egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE, egl_context);
-        eglDestroySurface(egl_display, o->egl_surface);
-        o->egl_surface = EGL_NO_SURFACE;
-    }
-    if (o->egl_window) { wl_egl_window_destroy(o->egl_window); o->egl_window = NULL; }
-    if (o->layer_surface) { zwlr_layer_surface_v1_destroy(o->layer_surface); o->layer_surface = NULL; }
-    if (o->surface) { wl_surface_destroy(o->surface); o->surface = NULL; }
-    o->configured = 0;
-    o->width = o->height = 0;
-}
-
-static void destroy_output(struct output *o) {
-    destroy_surface(o);
-    if (o->version >= 3) wl_output_release(o->wl_output);
-    else wl_output_destroy(o->wl_output);
-    for (struct output **pp = &outputs; *pp; pp = &(*pp)->next)
-        if (*pp == o) { *pp = o->next; break; }
-    free(o);
-}
-
-// ---- layer surface ---------------------------------------------------------
-static void ls_configure(void *data, struct zwlr_layer_surface_v1 *s, uint32_t serial,
-                         uint32_t w, uint32_t h) {
-    struct output *o = data;
-    o->width = w; o->height = h;
-    zwlr_layer_surface_v1_ack_configure(s, serial);
-    wl_surface_set_buffer_scale(o->surface, o->scale);
-    o->buf_scale = o->scale;
-    if (w == 0 || h == 0) return;
-    if (!o->egl_window) {
-        o->egl_window = wl_egl_window_create(o->surface, w * o->scale, h * o->scale);
-        o->egl_surface = eglCreatePlatformWindowSurface(egl_display, egl_config, o->egl_window, NULL);
-        if (o->egl_surface == EGL_NO_SURFACE) { fprintf(stderr, "topopaper: no EGL surface\n"); return; }
-        eglMakeCurrent(egl_display, o->egl_surface, o->egl_surface, egl_context);
-        eglSwapInterval(egl_display, 0);
-        fprintf(stderr, "topopaper: drawing on %s (%dx%d@%d)\n",
-                o->name[0] ? o->name : "output", (int)w, (int)h, o->scale);
-    } else {
-        wl_egl_window_resize(o->egl_window, w * o->scale, h * o->scale, 0, 0);
-    }
-    o->configured = 1;
-}
-// The compositor took the surface away (output disabled, or it refused the
-// layer). Drop it; it comes back on a settings change or a re-plugged output.
-static void ls_closed(void *data, struct zwlr_layer_surface_v1 *s) {
-    (void)s; struct output *o = data;
-    fprintf(stderr, "topopaper: surface on %s closed by the compositor\n",
-            o->name[0] ? o->name : "output");
-    destroy_surface(o);
-    o->closed = 1;
-}
-static const struct zwlr_layer_surface_v1_listener ls_listener = {
-    .configure = ls_configure, .closed = ls_closed };
-
-static void create_surface(struct output *o) {
-    o->surface = wl_compositor_create_surface(compositor);
-    struct wl_region *empty = wl_compositor_create_region(compositor);   // click-through
-    wl_surface_set_input_region(o->surface, empty);
-    wl_region_destroy(empty);
-    // BOTTOM by default, not BACKGROUND: same-layer stacking is creation
-    // order, so another wallpaper tool started later lands ON TOP of a
-    // persistent engine. One layer up, the engine always wins over background
-    // wallpapers yet stays under every window. layer = background gives the
-    // layer back for setups that want something else above it.
-    o->layer = cfg.layer_background;
-    o->layer_surface = zwlr_layer_shell_v1_get_layer_surface(
-        layer_shell, o->surface, o->wl_output,
-        o->layer ? ZWLR_LAYER_SHELL_V1_LAYER_BACKGROUND : ZWLR_LAYER_SHELL_V1_LAYER_BOTTOM,
-        "topopaper");
-    zwlr_layer_surface_v1_set_size(o->layer_surface, 0, 0);
-    zwlr_layer_surface_v1_set_anchor(o->layer_surface,
-        ZWLR_LAYER_SURFACE_V1_ANCHOR_TOP | ZWLR_LAYER_SURFACE_V1_ANCHOR_BOTTOM |
-        ZWLR_LAYER_SURFACE_V1_ANCHOR_LEFT | ZWLR_LAYER_SURFACE_V1_ANCHOR_RIGHT);
-    zwlr_layer_surface_v1_set_exclusive_zone(o->layer_surface, -1);
-    zwlr_layer_surface_v1_add_listener(o->layer_surface, &ls_listener, o);
-    wl_surface_commit(o->surface);
-}
-
-// Bring the surfaces in line with the settings: create where selected,
-// destroy where not, recreate where the layer changed.
-static void reconcile_outputs(void) {
-    if (!g_wl_ready) return;
-    for (struct output *o = outputs; o; o = o->next) {
-        if (!o->ready) continue;
-        int want = output_selected(o) && !o->closed;
-        if (o->surface && (!want || o->layer != cfg.layer_background)) {
-            fprintf(stderr, "topopaper: releasing %s\n", o->name[0] ? o->name : "output");
-            destroy_surface(o);
-        }
-        if (want && !o->surface) create_surface(o);
-    }
-}
-
-// ---- output listener ---------------------------------------------------------
-static void o_geometry(void *d, struct wl_output *o, int32_t x, int32_t y, int32_t pw,
-    int32_t ph, int32_t sp, const char *m, const char *md, int32_t tr) {
-    (void)d;(void)o;(void)x;(void)y;(void)pw;(void)ph;(void)sp;(void)m;(void)md;(void)tr; }
-static void o_mode(void *d, struct wl_output *o, uint32_t f, int32_t w, int32_t h, int32_t r) {
-    (void)d;(void)o;(void)f;(void)w;(void)h;(void)r; }
-static void o_done(void *d, struct wl_output *wo) {
-    (void)wo; struct output *o = d;
-    if (!o->ready) { o->ready = 1; g_out_dirty = 1; return; }
-    if (o->configured && o->scale != o->buf_scale) {   // scale changed live
-        o->buf_scale = o->scale;
-        wl_surface_set_buffer_scale(o->surface, o->scale);
-        wl_egl_window_resize(o->egl_window, o->width * o->scale, o->height * o->scale, 0, 0);
-    }
-}
-static void o_scale(void *d, struct wl_output *o, int32_t s) {
-    (void)o; ((struct output *)d)->scale = s > 0 ? s : 1; }
-static void o_name(void *d, struct wl_output *o, const char *n) {
-    (void)o; struct output *op = d;
-    snprintf(op->name, sizeof op->name, "%s", n ? n : "");
-}
-static void o_desc(void *d, struct wl_output *o, const char *n) { (void)d;(void)o;(void)n; }
-static const struct wl_output_listener output_listener = {
-    o_geometry, o_mode, o_done, o_scale, o_name, o_desc };
-
-// ---- registry --------------------------------------------------------------
-static void reg_global(void *data, struct wl_registry *reg, uint32_t name,
-                       const char *iface, uint32_t ver) {
-    (void)data;
-    if (!strcmp(iface, wl_compositor_interface.name))
-        compositor = wl_registry_bind(reg, name, &wl_compositor_interface, ver < 4 ? ver : 4);
-    else if (!strcmp(iface, wl_output_interface.name)) {
-        // v4 brings the name event (cfg.outputs); hotplugged outputs arrive
-        // here too and get a surface once their first done event lands
-        struct output *o = calloc(1, sizeof *o);
-        if (!o) return;
-        o->scale = 1;
-        o->global = name;
-        o->version = ver < 4 ? ver : 4;
-        o->wl_output = wl_registry_bind(reg, name, &wl_output_interface, o->version);
-        wl_output_add_listener(o->wl_output, &output_listener, o);
-        o->next = outputs; outputs = o;
-    } else if (!strcmp(iface, zwlr_layer_shell_v1_interface.name))
-        layer_shell = wl_registry_bind(reg, name, &zwlr_layer_shell_v1_interface, 1);
-}
-// unplugged output: its surface and EGL surface go with it
-static void reg_remove(void *d, struct wl_registry *r, uint32_t name) {
-    (void)d; (void)r;
-    for (struct output *o = outputs; o; o = o->next)
-        if (o->global == name) {
-            fprintf(stderr, "topopaper: output %s removed\n", o->name[0] ? o->name : "?");
-            destroy_output(o);
-            return;
-        }
-}
-static const struct wl_registry_listener registry_listener = { reg_global, reg_remove };
-
-static volatile sig_atomic_t running = 1, g_hup = 0;
-static void on_signal(int s) { if (s == SIGHUP) g_hup = 1; else running = 0; }
-
-static void init_egl(void) {
-    egl_display = eglGetPlatformDisplay(EGL_PLATFORM_WAYLAND_KHR, display, NULL);
-    if (egl_display == EGL_NO_DISPLAY || !eglInitialize(egl_display, NULL, NULL)) {
-        fprintf(stderr, "topopaper: EGL init failed\n"); exit(1); }
-    eglBindAPI(EGL_OPENGL_ES_API);
-    const EGLint cfg[] = { EGL_SURFACE_TYPE, EGL_WINDOW_BIT,
-        EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT,
-        EGL_RED_SIZE,8, EGL_GREEN_SIZE,8, EGL_BLUE_SIZE,8, EGL_ALPHA_SIZE,8, EGL_NONE };
-    EGLint n; if (!eglChooseConfig(egl_display, cfg, &egl_config, 1, &n) || n < 1) {
-        fprintf(stderr, "topopaper: no EGL config\n"); exit(1); }
-    const EGLint ctx[] = { EGL_CONTEXT_CLIENT_VERSION, 2, EGL_NONE };
-    egl_context = eglCreateContext(egl_display, egl_config, EGL_NO_CONTEXT, ctx);
-    if (egl_context == EGL_NO_CONTEXT) { fprintf(stderr, "topopaper: no EGL context\n"); exit(1); }
-    eglMakeCurrent(egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE, egl_context);
-    gl_init();
-}
-
 // ---- paths: the same rules as topopaper/paths.py ----------------------------
-//   packs   $XDG_DATA_HOME/topopaper/areas      ($TOPOPAPER_DATA, $TOPOPAPER_DIR)
-//   area    $XDG_STATE_HOME/topopaper/area      ($TOPOPAPER_DIR)
-//   config  $XDG_CONFIG_HOME/topopaper/config.ini ($TOPOPAPER_CONFIG)
+//   packs   <data>/areas      ($TOPOPAPER_DATA, $TOPOPAPER_DIR)
+//   area    <state>/area      ($TOPOPAPER_DIR)
+//   config  <conf>/config.ini ($TOPOPAPER_CONFIG)
+//   (user_dirs() in compat.c: XDG on Linux/macOS, %LOCALAPPDATA% on Windows)
 //   shipped data (hud.bin, lights.bin) next to the binary:
 //           $PREFIX/bin/topopaper -> $PREFIX/share/topopaper ($TOPOPAPER_SHARE),
-//           or <checkout>/build/topopaper -> <checkout>/data
-static void xdg_dir(char *out, size_t n, const char *var, const char *fallback) {
-    const char *v = getenv(var), *home = getenv("HOME");
-    if (v && v[0] == '/') snprintf(out, n, "%s/topopaper", v);
-    else snprintf(out, n, "%s/%s/topopaper", home ? home : ".", fallback);
-}
-
-static int file_exists(const char *p) {
-    struct stat st;
-    return stat(p, &st) == 0;
-}
-
-static void mkdirs(const char *p) {
-    char b[512];
-    snprintf(b, sizeof b, "%s", p);
-    for (char *c = b + 1; *c; c++)
-        if (*c == '/') { *c = 0; mkdir(b, 0755); *c = '/'; }
-    mkdir(b, 0755);
-}
-
+//           or <checkout>/build[/windows]/topopaper -> <checkout>/data
 static void resolve_paths(void) {
-    static char data[400], state[400], share[400], conf[400];
+    static char data[400], state[400], share[400], conf[400], run[400];
     const char *td = getenv("TOPOPAPER_DIR"), *dd = getenv("TOPOPAPER_DATA");
     const char *sd = getenv("TOPOPAPER_SHARE"), *cf = getenv("TOPOPAPER_CONFIG");
+    user_dirs(data, state, cache_dir, conf, run, sizeof data);
     if (td && *td) {
         snprintf(data, sizeof data, "%s", td);
         snprintf(state, sizeof state, "%s", td);
-    } else {
-        if (dd && *dd) snprintf(data, sizeof data, "%s", dd);
-        else xdg_dir(data, sizeof data, "XDG_DATA_HOME", ".local/share");
-        xdg_dir(state, sizeof state, "XDG_STATE_HOME", ".local/state");
+    } else if (dd && *dd) {
+        snprintf(data, sizeof data, "%s", dd);
     }
-    xdg_dir(cache_dir, sizeof cache_dir, "XDG_CACHE_HOME", ".cache");
     if (cf && *cf) snprintf(cfg_path, sizeof cfg_path, "%s", cf);
-    else {
-        xdg_dir(conf, sizeof conf, "XDG_CONFIG_HOME", ".config");
-        snprintf(cfg_path, sizeof cfg_path, "%s/config.ini", conf);
-    }
+    else snprintf(cfg_path, sizeof cfg_path, "%s/config.ini", conf);
     if (sd && *sd) snprintf(share, sizeof share, "%s", sd);
     else {
+        // installed, then a checkout's build/ and build/windows/
+        static const char *rel[] = { "../share/topopaper", "../data", "../../data" };
         char exe[300], probe[400];
-        ssize_t n = readlink("/proc/self/exe", exe, sizeof exe - 1);
-        if (n < 0) n = 0;
-        exe[n] = 0;
-        char *sl = strrchr(exe, '/');
-        if (sl) *sl = 0;
-        snprintf(probe, sizeof probe, "%s/../share/topopaper/hud.bin", exe);
-        if (file_exists(probe)) snprintf(share, sizeof share, "%s/../share/topopaper", exe);
-        else snprintf(share, sizeof share, "%s/../data", exe);
+        exe_dir(exe, sizeof exe);
+        snprintf(share, sizeof share, "%s/%s", exe, rel[0]);
+        for (int i = 0; i < 3; i++) {
+            snprintf(probe, sizeof probe, "%s/%s/hud.bin", exe, rel[i]);
+            if (path_exists(probe)) { snprintf(share, sizeof share, "%s/%s", exe, rel[i]); break; }
+        }
     }
     snprintf(areas_dir, sizeof areas_dir, "%s/areas", data);
     snprintf(area_path, sizeof area_path, "%s/area", state);
     snprintf(hud_path, sizeof hud_path, "%s/hud.bin", share);
     snprintf(lights_path, sizeof lights_path, "%s/lights.bin", data);  // user rebuild wins
-    if (!file_exists(lights_path))
+    if (!path_exists(lights_path))
         snprintf(lights_path, sizeof lights_path, "%s/lights.bin", share);
-    mkdirs(state);
+    snprintf(covered_path, sizeof covered_path, "%s/topopaper-covered", run);
+    snprintf(progress_path, sizeof progress_path, "%s/topopaper-progress.bin", run);
+    make_dirs(state);
 }
 
-int main(void) {
-    struct sigaction sa;
-    memset(&sa, 0, sizeof sa);
-    sa.sa_handler = on_signal;               // no SA_RESTART: poll() wakes at once
-    sigemptyset(&sa.sa_mask);
-    sigaction(SIGINT, &sa, NULL);
-    sigaction(SIGTERM, &sa, NULL);
-    sigaction(SIGHUP, &sa, NULL);            // reload config.ini now
-    clock_gettime(CLOCK_MONOTONIC, &t_start);
+void engine_setup(void) {
+    install_signals();
+    t_start = mono_sec();
     srand((unsigned)(time(NULL) ^ getpid()));
     resolve_paths();
     cfg_poll(0);
-    const char *rt = getenv("XDG_RUNTIME_DIR");
-    snprintf(covered_path, sizeof covered_path, "%s/topopaper-covered", rt ? rt : "/tmp");
-    snprintf(progress_path, sizeof progress_path, "%s/topopaper-progress.bin",
-             rt ? rt : "/tmp");
     areas_mtime = file_mtime(areas_dir);
     discover_packs();
     p_cur = pick_initial(0);
     if (p_cur < 0)
         fprintf(stderr, "topopaper: no area packs yet — quiet gradient until one appears in %s\n",
                 areas_dir);
-
-    display = wl_display_connect(NULL);
-    if (!display) { fprintf(stderr, "topopaper: no Wayland display\n"); return 1; }
-    init_egl();
-    struct wl_registry *reg = wl_display_get_registry(display);
-    wl_registry_add_listener(reg, &registry_listener, NULL);
-    wl_display_roundtrip(display);                 // bind globals
-    if (!compositor || !layer_shell) { fprintf(stderr, "topopaper: missing wayland iface\n"); return 1; }
-    wl_display_roundtrip(display);                 // enumerate outputs: names + scales
-    g_wl_ready = 1;
-    g_out_dirty = 1;
-
-    // Main loop: poll the cheap state, keep the surfaces in line with the
-    // settings, tick a frame when one is due and an output can take it, then
-    // sleep on the Wayland fd until the next tick (or a frame callback, or a
-    // signal). Never longer than 0.4 s, so settings/fly requests stay prompt
-    // even with nothing on screen.
-    int fd = wl_display_get_fd(display), err = 0;
-    double next_tick = 0.0;
-    while (running) {
-        if (g_hup) { g_hup = 0; cfg_poll(1); }
-        update_targets(now_sec());
-        if (g_out_dirty) { g_out_dirty = 0; reconcile_outputs(); }
-        int stalled = 0;
-        if (now_sec() >= next_tick) {
-            if (frame_tick()) next_tick = t_prev + frame_min_dt();
-            else stalled = 1;                // every output busy: wait for a callback
-        }
-        while (wl_display_prepare_read(display) != 0)
-            if (wl_display_dispatch_pending(display) < 0) { err = 1; break; }
-        if (err) break;
-        if (wl_display_flush(display) < 0 && errno != EAGAIN) {
-            wl_display_cancel_read(display); err = 1; break;
-        }
-        double wait = stalled ? 0.4 : next_tick - now_sec();
-        if (wait > 0.4) wait = 0.4;
-        if (wait < 0.0) wait = 0.0;
-        struct pollfd pfd = { .fd = fd, .events = POLLIN };
-        int r = poll(&pfd, 1, (int)ceil(wait * 1000.0));
-        if (r > 0 && (pfd.revents & POLLIN)) {
-            if (wl_display_read_events(display) < 0) { err = 1; break; }
-        } else {
-            wl_display_cancel_read(display);
-            if (r > 0 && (pfd.revents & (POLLERR | POLLHUP))) { err = 1; break; }
-        }
-        if (wl_display_dispatch_pending(display) < 0) { err = 1; break; }
-    }
-    if (err) fprintf(stderr, "topopaper: lost the Wayland connection\n");
-
-    // clean exit: surfaces, outputs, textures, EGL, connection
-    while (outputs) destroy_output(outputs);
-    eglMakeCurrent(egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
-    eglDestroyContext(egl_display, egl_context);
-    eglTerminate(egl_display);
-    if (layer_shell) zwlr_layer_shell_v1_destroy(layer_shell);
-    if (compositor) wl_compositor_destroy(compositor);
-    wl_registry_destroy(reg);
-    wl_display_disconnect(display);
-    return err;
 }

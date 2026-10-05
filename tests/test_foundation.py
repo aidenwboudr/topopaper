@@ -18,6 +18,7 @@ def home(tmp_path, monkeypatch):
     return tmp_path
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="XDG layout: Linux and macOS")
 def test_xdg_defaults(home):
     assert paths.config_file() == home / ".config/topopaper/config.ini"
     assert paths.areas_dir() == home / ".local/share/topopaper/areas"

@@ -1,2 +1,2 @@
-"""topopaper: a live topographic wallpaper for Wayland."""
-__version__ = "1.0.0"
+"""topopaper: a live topographic wallpaper for Linux, Windows and macOS."""
+__version__ = "1.1.0"

@@ -23,7 +23,7 @@ jobs:
       - name: Lint
         run: |
           ruff check topopaper tests
-          shellcheck install.sh uninstall.sh bin/* tests/*.sh
+          shellcheck install.sh uninstall.sh bin/topopaper-* tests/*.sh
       - name: engine/themes.h matches topopaper/themes.py
         run: python3 -m topopaper.themes | diff -u engine/themes.h -
 
@@ -75,3 +75,161 @@ jobs:
         with:
           name: render-smoke
           path: ci-shots/
+
+  # ---- Windows ---------------------------------------------------------------------
+  windows-build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: mingw-w64
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq gcc-mingw-w64-x86-64 binutils-mingw-w64-x86-64
+      - name: Build (warnings are errors) + release zip
+        run: |
+          make windows WIN_CFLAGS="-O2 -Werror"
+          make dist-windows
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-zip
+          path: |
+            dist/topopaper-windows-x64.zip
+            dist/topopaper-windows-x64.zip.sha256
+
+  windows:
+    needs: windows-build
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-2022, windows-2025]      # before 24H2, and 24H2 (build 26100)
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/download-artifact@v4
+        with:
+          name: windows-zip
+          path: dist
+      - name: Unit tests
+        run: |
+          python -m pip install -q pytest numpy pillow
+          python -m pytest -q tests
+      - name: install.ps1 (Windows PowerShell 5.1)
+        shell: powershell
+        run: .\install.ps1 -Zip dist\topopaper-windows-x64.zip -Yes -NoLaunch
+      - name: Mesa llvmpipe (the runner has no OpenGL 2 driver)
+        shell: pwsh
+        run: |
+          $v = '26.2.4'
+          curl.exe -fsSL -o mesa.7z "https://github.com/pal1000/mesa-dist-win/releases/download/$v/mesa3d-$v-release-msvc.7z"
+          7z e mesa.7z -omesa x64/opengl32.dll x64/libgallium_wgl.dll -y | Out-Null
+          Copy-Item mesa\*.dll "$env:LOCALAPPDATA\Programs\topopaper\bin\"
+          "GALLIUM_DRIVER=llvmpipe" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+      - name: Render a frame (TOPA_SHOT)
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory shots -Force | Out-Null
+          $env:TOPA_SHOT = "$pwd\shots\earth.ppm"; $env:TOPA_SUN_T = "1780056000"
+          $p = Start-Process "$env:LOCALAPPDATA\Programs\topopaper\bin\topopaper.exe" -PassThru `
+                 -RedirectStandardError shots\engine.log
+          if (-not $p.WaitForExit(90000)) { $p.Kill(); throw "engine did not finish" }
+          Get-Content shots\engine.log
+          & "$env:LOCALAPPDATA\topopaper\venv\Scripts\python.exe" tests\ppm2png.py shots\earth.ppm shots\earth.png
+      - name: Session on the real desktop
+        shell: pwsh
+        run: |
+          $ctl = "$env:LOCALAPPDATA\Programs\topopaper\bin\topopaper-ctl.cmd"
+          & $ctl restart
+          if ($LASTEXITCODE -ne 0) { throw "the session did not start" }
+          Start-Sleep 30
+          Add-Type -AssemblyName System.Windows.Forms, System.Drawing
+          $b = [System.Windows.Forms.SystemInformation]::VirtualScreen
+          $bmp = New-Object System.Drawing.Bitmap $b.Width, $b.Height
+          [System.Drawing.Graphics]::FromImage($bmp).CopyFromScreen($b.Left, $b.Top, 0, 0, $bmp.Size)
+          $bmp.Save("$pwd\shots\desktop.png")
+          & $ctl status
+          & $ctl doctor --offline
+          & $ctl stop
+          if ($LASTEXITCODE -ne 0) { throw "the session did not stop" }
+          New-Item -ItemType Directory shots\session -Force | Out-Null
+          Copy-Item "$env:LOCALAPPDATA\topopaper\state\logs\*.log" shots\session\ -ErrorAction SilentlyContinue
+          Get-Content shots\session\session.log, shots\session\engine.log -ErrorAction SilentlyContinue
+      - name: Settings window (Tk)
+        shell: pwsh
+        run: |
+          $py = "$env:LOCALAPPDATA\topopaper\venv\Scripts\python.exe"
+          & $py -c "import sys, tkinter; print(sys.version); print('Tk', tkinter.Tcl().eval('info patchlevel'))"
+          & "$env:LOCALAPPDATA\Programs\topopaper\bin\topopaper-settings.cmd"
+          Start-Sleep 12
+          Add-Type -AssemblyName System.Windows.Forms, System.Drawing
+          $b = [System.Windows.Forms.SystemInformation]::VirtualScreen
+          $bmp = New-Object System.Drawing.Bitmap $b.Width, $b.Height
+          [System.Drawing.Graphics]::FromImage($bmp).CopyFromScreen($b.Left, $b.Top, 0, 0, $bmp.Size)
+          $bmp.Save("$pwd\shots\settings.png")
+          Get-Process pythonw -ErrorAction SilentlyContinue | Stop-Process -Force
+      - name: uninstall.ps1
+        shell: powershell
+        run: |
+          & "$env:LOCALAPPDATA\Programs\topopaper\uninstall.ps1" -Purge
+          if (Test-Path "$env:LOCALAPPDATA\Programs\topopaper") { throw "still installed" }
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: windows-shots-${{ matrix.os }}
+          path: shots/
+
+  # ---- macOS -------------------------------------------------------------------------
+  macos:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build (warnings are errors)
+        run: make CFLAGS="-O2 -Werror"
+      - name: install.sh
+        run: |
+          ./install.sh --yes --no-launch
+          test -x ~/Applications/Topopaper.app/Contents/MacOS/Topopaper
+      - name: Settings window (Tk)
+        run: |
+          mkdir -p shots
+          py=~/.local/share/topopaper/venv/bin/python
+          $py -c "import sys, tkinter; print(sys.version); print('Tk', tkinter.Tcl().eval('info patchlevel'))"
+          ~/.local/bin/topopaper-settings > shots/settings.log 2>&1 &
+          sleep 12
+          screencapture -x shots/settings.png || true
+          kill %1 2>/dev/null || true
+          cat shots/settings.log
+      - name: Unit tests
+        run: |
+          ~/.local/share/topopaper/venv/bin/python -m pip install -q pytest
+          ~/.local/share/topopaper/venv/bin/python -m pytest -q tests
+      - name: Render a frame (TOPA_SHOT)
+        run: |
+          mkdir -p shots
+          TOPA_SHOT="$PWD/shots/earth.ppm" TOPA_SUN_T=1780056000 ~/.local/bin/topopaper 2> shots/engine.log &
+          pid=$!
+          for _ in $(seq 120); do kill -0 $pid 2>/dev/null || break; sleep 1; done
+          cat shots/engine.log
+          ~/.local/share/topopaper/venv/bin/python tests/ppm2png.py shots/earth.ppm shots/earth.png
+      - name: Session on the real desktop
+        run: |
+          ~/.local/bin/topopaper-ctl restart
+          sleep 20
+          screencapture -x shots/desktop.png || true
+          ~/.local/bin/topopaper-ctl status
+          ~/.local/bin/topopaper-ctl doctor --offline || true
+          ~/.local/bin/topopaper-ctl stop
+          mkdir -p shots/session
+          cp ~/.local/state/topopaper/logs/*.log shots/session/ || true
+          cat shots/session/session.log shots/session/engine.log || true
+      - name: uninstall.sh
+        run: ./uninstall.sh --purge && test ! -e ~/.local/bin/topopaper && test ! -e ~/Applications/Topopaper.app
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: macos-shots-${{ matrix.os }}
+          path: shots/

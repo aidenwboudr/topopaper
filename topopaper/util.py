@@ -2,12 +2,8 @@
 import json
 import os
 import re
-import shutil
-import subprocess
 
-from . import paths
-
-NOTIFY_HINT = "string:x-canonical-private-synchronous:topopaper"
+from . import paths, system
 
 
 def slugify(s):
@@ -15,12 +11,10 @@ def slugify(s):
 
 
 def notify(msg, ms=2600):
-    """Desktop notification if a notifier exists; always echo to stderr."""
-    print(f"topopaper: {msg}", file=os.sys.stderr, flush=True)
-    if shutil.which("notify-send"):
-        subprocess.run(["notify-send", "-t", str(ms), "-h", NOTIFY_HINT,
-                        "topopaper", msg], check=False,
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    """Desktop notification where there's a notifier; always echo to stderr."""
+    if os.sys.stderr is not None:           # None under pythonw.exe
+        print(f"topopaper: {msg}", file=os.sys.stderr, flush=True)
+    system.notify("topopaper", msg, ms)
 
 
 def write_atomic(path, text):
@@ -89,4 +83,6 @@ def ctl_cmd(*args):
     env = dict(os.environ)
     root = str(paths.PKG.parent)
     env["PYTHONPATH"] = root + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
+    if system.WINDOWS:
+        env["PYTHONUTF8"] = "1"             # logs and pipes in UTF-8, not the ANSI code page
     return [sys.executable, "-m", "topopaper.cli", *args], env

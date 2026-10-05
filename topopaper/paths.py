@@ -1,12 +1,18 @@
-"""Where topopaper keeps things.
+r"""Where topopaper keeps things.
 
-Installed layout (XDG):
+Installed layout on Linux and macOS (XDG):
     $PREFIX/share/topopaper/      code + read-only data (hud.bin, lights.bin, fonts)
     $XDG_CONFIG_HOME/topopaper/   config.ini
     $XDG_DATA_HOME/topopaper/     area packs (areas/), user-built lights.bin, venv
     $XDG_STATE_HOME/topopaper/    the `area` file (which pack is on screen)
     $XDG_CACHE_HOME/topopaper/    tile caches, weather.txt, location.json
     $XDG_RUNTIME_DIR              covered flag, build progress, session lock
+                                  (macOS without it: ~/Library/Caches/topopaper/run)
+
+On Windows:
+    %LOCALAPPDATA%\Programs\topopaper\   bin\ (engine, launchers) + share\topopaper\
+    %APPDATA%\topopaper\                  config.ini
+    %LOCALAPPDATA%\topopaper\             areas\, venv\, and state\ cache\ run\ below it
 
 Overrides (the engine honours the same ones, see engine/topopaper.c):
     TOPOPAPER_DIR      single-directory mode: packs and state live here
@@ -15,14 +21,22 @@ Overrides (the engine honours the same ones, see engine/topopaper.c):
     TOPOPAPER_CONFIG   path of config.ini
 """
 import os
+import sys
 from pathlib import Path
 
 PKG = Path(__file__).resolve().parent
+WINDOWS = sys.platform == "win32"
 
 
 def _xdg(var, fallback):
     v = os.environ.get(var)
     return Path(v) if v and os.path.isabs(v) else Path.home() / fallback
+
+
+def _local():
+    """Windows: %LOCALAPPDATA%\\topopaper."""
+    v = os.environ.get("LOCALAPPDATA")
+    return (Path(v) if v else Path.home() / "AppData" / "Local") / "topopaper"
 
 
 def share_dir() -> Path:
@@ -37,25 +51,40 @@ def share_dir() -> Path:
 
 def data_dir() -> Path:
     v = os.environ.get("TOPOPAPER_DIR") or os.environ.get("TOPOPAPER_DATA")
-    return Path(v) if v else _xdg("XDG_DATA_HOME", ".local/share") / "topopaper"
+    if v:
+        return Path(v)
+    return _local() if WINDOWS else _xdg("XDG_DATA_HOME", ".local/share") / "topopaper"
 
 
 def state_dir() -> Path:
     v = os.environ.get("TOPOPAPER_DIR")
-    return Path(v) if v else _xdg("XDG_STATE_HOME", ".local/state") / "topopaper"
+    if v:
+        return Path(v)
+    return _local() / "state" if WINDOWS else _xdg("XDG_STATE_HOME", ".local/state") / "topopaper"
 
 
 def cache_dir() -> Path:
-    return _xdg("XDG_CACHE_HOME", ".cache") / "topopaper"
+    return _local() / "cache" if WINDOWS else _xdg("XDG_CACHE_HOME", ".cache") / "topopaper"
 
 
 def config_file() -> Path:
     v = os.environ.get("TOPOPAPER_CONFIG")
-    return Path(v) if v else _xdg("XDG_CONFIG_HOME", ".config") / "topopaper" / "config.ini"
+    if v:
+        return Path(v)
+    if WINDOWS:
+        ra = os.environ.get("APPDATA")
+        return (Path(ra) if ra else _local()) / "topopaper" / "config.ini"
+    return _xdg("XDG_CONFIG_HOME", ".config") / "topopaper" / "config.ini"
 
 
 def runtime_dir() -> Path:
-    return Path(os.environ.get("XDG_RUNTIME_DIR") or "/tmp")
+    if WINDOWS:
+        return _local() / "run"
+    v = os.environ.get("XDG_RUNTIME_DIR")
+    if not v and sys.platform == "darwin":
+        # per user, and the same for a LaunchAgent and a Terminal ($TMPDIR may differ)
+        return Path.home() / "Library" / "Caches" / "topopaper" / "run"
+    return Path(v or "/tmp")
 
 
 def areas_dir() -> Path:
@@ -101,4 +130,6 @@ def log_dir() -> Path:
 
 
 def venv_python() -> Path:
+    if WINDOWS:
+        return data_dir() / "venv" / "Scripts" / "python.exe"
     return data_dir() / "venv" / "bin" / "python"
