@@ -5,11 +5,16 @@ on:
     branches: [main]
   pull_request:
 
+# A new push to a PR replaces its running CI; runs on main always finish.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   checks:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Dependencies
         run: |
           sudo apt-get update -qq
@@ -40,7 +45,7 @@ jobs:
           if command -v apt-get >/dev/null; then apt-get update -qq && apt-get install -y -qq git ca-certificates; fi
           if command -v pacman >/dev/null; then pacman -Syu --noconfirm --needed git; fi
           if command -v dnf >/dev/null; then dnf install -y -q git; fi
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: install.sh
         env:
           DEBIAN_FRONTEND: noninteractive
@@ -61,7 +66,7 @@ jobs:
     steps:
       - name: Dependencies
         run: pacman -Syu --noconfirm --needed base-devel git pkgconf wayland mesa sway grim python python-numpy python-pillow
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Build
         run: make
       - name: Globe (starter download, else build it)
@@ -72,7 +77,7 @@ jobs:
         run: tests/render-smoke.sh "$PWD/ci-data" "$PWD/ci-shots" earth
       - name: Flight seams (synthetic packs, every frame of five flights)
         run: tests/flight-check.sh "$PWD/ci-flights"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         if: always()
         with:
           name: render-smoke
@@ -85,14 +90,14 @@ jobs:
   windows-build:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: mingw-w64
         run: sudo apt-get update -qq && sudo apt-get install -y -qq gcc-mingw-w64-x86-64 binutils-mingw-w64-x86-64
       - name: Build (warnings are errors) + release zip
         run: |
           make windows WIN_CFLAGS="-O2 -Werror"
           make dist-windows
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         with:
           name: windows-zip
           path: |
@@ -107,11 +112,11 @@ jobs:
         os: [windows-2022, windows-2025]      # before 24H2, and 24H2 (build 26100)
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v7
         with:
           name: windows-zip
           path: dist
@@ -177,7 +182,7 @@ jobs:
         run: |
           & "$env:LOCALAPPDATA\Programs\topopaper\uninstall.ps1" -Purge
           if (Test-Path "$env:LOCALAPPDATA\Programs\topopaper") { throw "still installed" }
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         if: always()
         with:
           name: windows-shots-${{ matrix.os }}
@@ -191,7 +196,7 @@ jobs:
         os: [macos-15, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Build (warnings are errors)
         run: make CFLAGS="-O2 -Werror"
       - name: install.sh
@@ -233,7 +238,7 @@ jobs:
           cat shots/session/session.log shots/session/engine.log || true
       - name: uninstall.sh
         run: ./uninstall.sh --purge && test ! -e ~/.local/bin/topopaper && test ! -e ~/Applications/Topopaper.app
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         if: always()
         with:
           name: macos-shots-${{ matrix.os }}
