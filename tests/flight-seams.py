@@ -58,7 +58,9 @@ def trace(rec):
 
 def tone(rec, n, tr, maps):
     sh = load(f"{rec}/d{n:05d}_1.ppm") / 255.0
-    void = float((sh.sum(axis=2) < 0.5).mean()) if tr[n]["h"] < 0.12 else 0.0
+    mag = (sh[..., 0] > 0.9) & (sh[..., 1] < 0.1) & (sh[..., 2] > 0.9)   # nothing covers
+    void = float(mag.mean()) if tr[n]["h"] < 0.12 else 0.0
+    sh = np.where(mag[..., None], 0.0, sh)
     cs = [box(load(f"{rec}/d{n:05d}_{k}.ppm"), 6) for k in (2, 3, 4)]
     # where a share changes across the screen (the hand-off band)
     g = np.zeros(sh.shape[:2], np.float32)
