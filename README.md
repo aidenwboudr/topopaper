@@ -7,6 +7,8 @@ ski resort — with a quiet clock and the weather in the corner.
 
 ![The globe at night, and a ski resort's contour map](docs/screenshots/hero.png)
 
+*[Watch it live](docs/screenshots/ambient.mp4) — a quiet minute over Bridger Bowl.*
+
 - **Real terrain anywhere on Earth.** Type a place ("Zermatt", "Yosemite",
   "Hokkaido") and topopaper builds a map of it from open elevation and
   OpenStreetMap data, then flies there.
