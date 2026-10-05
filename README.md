@@ -1,7 +1,7 @@
 # topopaper
 
-A live topographic wallpaper for Wayland. Your desktop becomes a slowly
-breathing contour map of real terrain — from a globe lit by the actual sun,
+A live topographic wallpaper for Linux (Wayland), Windows and macOS. Your
+desktop becomes a slowly breathing contour map of real terrain — from a globe lit by the actual sun,
 down through mountain ranges and valleys, to the runs and lifts of a single
 ski resort — with a quiet clock and the weather in the corner.
 
@@ -20,47 +20,62 @@ ski resort — with a quiet clock and the weather in the corner.
 
 ## Requirements
 
-- A Wayland compositor that supports **wlr-layer-shell**: Sway/SwayFX,
-  Hyprland, niri, river, Wayfire, KDE Plasma 6, and most wlroots-based
-  compositors. **GNOME is not supported** (it has no layer-shell).
-- OpenGL ES 2 (any GPU driver, or Mesa's software renderer).
-- Linux with Python 3, GTK 4 and libadwaita (the installer handles this on
-  Arch, Debian/Ubuntu, Fedora, openSUSE, Void and Alpine).
+- **Linux**: a Wayland compositor that supports **wlr-layer-shell**:
+  Sway/SwayFX, Hyprland, niri, river, Wayfire, KDE Plasma 6, and most
+  wlroots-based compositors. **GNOME is not supported** (it has no
+  layer-shell). OpenGL ES 2 (any GPU driver, or Mesa's software renderer),
+  Python 3, GTK 4 and libadwaita (the installer handles this on Arch,
+  Debian/Ubuntu, Fedora, openSUSE, Void and Alpine).
+- **Windows** 10 or 11 (64-bit) with an OpenGL 2 graphics driver (every
+  current GPU has one), and Python 3.9 or newer (the installer offers to
+  install it with winget).
+- **macOS** 10.15 or newer, the Xcode command line tools, and Python 3.9 or
+  newer with Tk (the one from python.org, or `brew install python python-tk`).
+
+How each system is supported, and what differs: [docs/PLATFORMS.md](docs/PLATFORMS.md).
 
 ## Install
 
-```sh
-git clone https://github.com/aidenwboudr/topopaper
-cd topopaper
-./install.sh
-```
-
-or in one line:
+**Linux and macOS**, in a terminal:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/aidenwboudr/topopaper/main/install.sh | bash
 ```
 
-The installer checks your desktop, offers to install missing system packages
-(it shows the exact command first), builds the wallpaper, installs it into
-`~/.local`, downloads the starter globe (~30 MB), and asks whether to start at
-login and whether to add a **Super+Shift+B** search shortcut. Nothing in your
-compositor config changes without a yes.
+or from a checkout: `git clone https://github.com/aidenwboudr/topopaper && topopaper/install.sh`.
 
-Then open **Topopaper** from your app launcher (or run `topopaper-settings`)
-and tell it where home is.
+The installer checks your desktop, offers to install missing system packages
+on Linux (it shows the exact command first), builds the wallpaper, installs
+it into `~/.local`, downloads the starter globe (~30 MB), and asks whether to
+start at login and whether to add a **Super+Shift+B** search shortcut.
+Nothing in your compositor config changes without a yes.
+
+**Windows**, in PowerShell:
+
+```powershell
+irm https://raw.githubusercontent.com/aidenwboudr/topopaper/main/install.ps1 | iex
+```
+
+It downloads the prebuilt wallpaper from the latest release into
+`%LOCALAPPDATA%\Programs\topopaper`, sets up Python for the map builder, adds
+Start menu entries, downloads the globe, and asks about starting at sign-in
+and a **Win+Shift+B** search shortcut. No administrator rights needed.
+
+Then open **Topopaper** from your app launcher or Start menu (or run
+`topopaper-settings`) and tell it where home is.
 
 ![The settings app](docs/screenshots/settings.png)
 
 To remove it: `./uninstall.sh` (keeps your maps and settings) or
-`./uninstall.sh --purge`.
+`./uninstall.sh --purge`; on Windows, `uninstall.ps1` in the install folder
+(`-Purge` deletes the maps and settings too).
 
 ## Using it
 
 | | |
 |---|---|
 | **Settings** | `topopaper-settings` — maps, theme, clock and weather, motion, displays, autostart |
-| **Go somewhere** | Super+Shift+B (if you added the shortcut), or `topopaper-ctl search` — pick a map or type any place |
+| **Go somewhere** | Super+Shift+B (Win+Shift+B on Windows; on macOS make one in the Shortcuts app), or `topopaper-ctl search` — pick a map or type any place |
 | **Fly to a map** | `topopaper-ctl fly zermatt` (no name: the next map) |
 | **Start / restart / stop** | `topopaper-ctl restart`, `topopaper-ctl stop` |
 | **Something wrong?** | `topopaper-ctl doctor` checks the install and your desktop |
@@ -74,13 +89,15 @@ while when the public map servers are busy. Maps you searched
 for are kept until you delete them in Settings → Places, or clean up old ones
 with `topopaper-ctl gc`.
 
-Settings live in `~/.config/topopaper/config.ini` — the settings app edits it,
-and so can you; the wallpaper picks up changes within a second.
+Settings live in `~/.config/topopaper/config.ini` (Windows:
+`%APPDATA%\topopaper\config.ini`) — the settings app edits it, and so can
+you; the wallpaper picks up changes within a second.
 
 ### Starting at login by hand
 
-If you'd rather add it to your compositor config yourself, run
-`topopaper-session` at startup:
+`topopaper-ctl autostart enable` sets this up for you on every system (on
+Windows a sign-in entry, on macOS a LaunchAgent). If you'd rather add it to
+your compositor config yourself on Linux, run `topopaper-session` at startup:
 
 | compositor | line |
 |---|---|
@@ -122,9 +139,11 @@ caches everything it downloads.
 
 ## How it works
 
-A small C engine draws the map on a Wayland layer-shell surface with OpenGL
-ES 2; everything else (map building, search, weather, the settings app) is
-Python. See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the pieces and
+A small C engine draws the map with OpenGL: on a Wayland layer-shell
+surface, behind the desktop icons on Windows, at desktop level on macOS.
+Everything else (map building, search, weather, the settings app) is Python.
+See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the pieces,
+[docs/PLATFORMS.md](docs/PLATFORMS.md) for the per-system parts and
 [CONTRIBUTING.md](CONTRIBUTING.md) to hack on it.
 
 ## License

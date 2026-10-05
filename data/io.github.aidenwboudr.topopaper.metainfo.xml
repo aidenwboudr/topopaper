@@ -53,6 +53,11 @@
   </supports>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="1.1.0" date="2026-10-05">
+      <description>
+        <p>Runs on Windows 10 and 11 and on macOS, with installers for both.</p>
+      </description>
+    </release>
     <release version="1.0.0" date="2026-10-04">
       <description>
         <p>First release as an installable app, with a settings window and a first-run welcome.</p>

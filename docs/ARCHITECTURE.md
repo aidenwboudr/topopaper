@@ -5,8 +5,8 @@
                      │  re-read on mtime change
    ┌─────────────────┼──────────────────────────────────────────────┐
    │                 ▼                                              │
-   │  topopaper (C engine, engine/topopaper.c)                      │
-   │    layer-shell surface per output, GLES2, draws packs + HUD    │
+   │  topopaper (C engine, engine/topopaper.c + a backend per OS)   │
+   │    a surface per display, OpenGL, draws packs + HUD            │
    │    polls (~2.5×/s): area file, config.ini, covered flag,       │
    │    battery, build progress; (30 s) weather.txt; (20 s) tz      │
    └──────────▲──────────────▲───────────────▲──────────────────────┘
@@ -16,16 +16,22 @@
                        runs the compositor watcher + weather refresh
 ```
 
-The engine never touches the network and never forks. Everything else is
-Python in the `topopaper` package, reached through three launchers in `bin/`:
+The engine never touches the network and never forks. Its core knows GL but
+no window system: `engine/platform.h` is the seam to the per-OS backends
+(`wayland.c`, `win32.c`, `macos.m`) and OS services (`compat.c`); see
+[PLATFORMS.md](PLATFORMS.md). Everything else is Python in the `topopaper`
+package, reached through three launchers in `bin/` (`.cmd` files from
+`windows/` on Windows):
 
 | launcher | module | what |
 |---|---|---|
 | `topopaper-ctl` | `topopaper.cli` | every command (fly, search, build, doctor, …) |
 | `topopaper-session` | `topopaper.session` | what autostart runs: engine + helpers |
-| `topopaper-settings` | `topopaper.settings` | GTK 4 + libadwaita settings window |
+| `topopaper-settings` | `topopaper.settings` | GTK 4 + libadwaita settings window (Tk: `topopaper.tkui` on Windows, macOS, or without GTK) |
 
 ## Files
+
+On Linux and macOS (Windows: see [PLATFORMS.md](PLATFORMS.md)):
 
 | what | where (`topopaper/paths.py`) |
 |---|---|
@@ -61,10 +67,12 @@ the engine flies there. The engine writes it too when it auto-roams.
 | `neta` | unix time the `@` event starts |
 | `apack`, `afrz` | pack name and its freezing level in metres (draws the snowline) |
 
-**location.json** — `{"tz": "Area/City", ...}`; the clock follows `tz`.
+**location.json** — `{"tz": "Area/City", "utc_offset": seconds, ...}`; the
+clock follows `tz` (on Windows, whose C runtime has no IANA zones, `utc_offset`).
 
 **covered flag** — `1` while windows cover the wallpaper on every visible
 workspace, else `0`. Written by `topopaper.watch` (one backend per compositor).
+The Windows and macOS backends see occlusion themselves and ignore it.
 
 ## Area packs
 
