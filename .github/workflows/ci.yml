@@ -148,8 +148,7 @@ jobs:
             Start-Sleep 10
             $b = [System.Windows.Forms.SystemInformation]::VirtualScreen
             $bmp = New-Object System.Drawing.Bitmap $b.Width, $b.Height
-            [System.Drawing.Graphics]::FromImage($bmp).CopyFromScreen($b.Left, $b.Top, 0, 0, $bmp.Size,
-                [System.Drawing.CopyPixelOperation]::SourceCopy -bor [System.Drawing.CopyPixelOperation]::CaptureBlt)
+            [System.Drawing.Graphics]::FromImage($bmp).CopyFromScreen($b.Left, $b.Top, 0, 0, $bmp.Size)
             $bmp.Save("$pwd\shots\attach-$m.png")
             & $py -c "from topopaper import system; system.close_engine_windows()"
             if (-not $p.WaitForExit(10000)) { $p.Kill() }
