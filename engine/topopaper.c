@@ -36,11 +36,12 @@
 //     top three fill shader slots 0-2; slot 3 holds the finest pack covering
 //     the whole view during flights, so no part of the screen is ever bare.
 //     Every slot shades with one shared scale and the roads/lifts/borders
-//     composite as one layer, so overlapping packs hand over without
-//     showing their rectangles. Only packs whose bbox INTERSECTS THE VIEW
-//     are candidates — same-scale SIBLING packs elsewhere on the map (Tetons
-//     vs Wind Rivers) never blend in by height alone, and a cross-country
-//     flight naturally picks up each area it overflies. slot0 is always the
+//     composite as one layer that appears once its scale fills the view, so
+//     overlapping packs hand over without showing their rectangles. Only
+//     packs whose bbox INTERSECTS THE VIEW are candidates — same-scale
+//     SIBLING packs elsewhere on the map (Tetons vs Wind Rivers) never
+//     blend in by height alone, and a cross-country flight naturally picks
+//     up each area it overflies. slot0 is always the
 //     DOMINANT pack.
 //   * fly-to (a new name in the area file) runs a van Wijk–Nuij path to the
 //     target's live idle camera; a long dive naturally sweeps through every
@@ -120,6 +121,7 @@ struct pack {
     // 2 features+water rows, 3 labels; files stay open between frames
     int    up_stage, up_row, fw_w, fw_h, wat_w, wat_h;
     float  fade;                    // eases 0 -> 1 once resident (weights x fade)
+    float  fcov;                    // feature gate, eased (see FEATURE GATES)
     FILE  *up_ft, *up_ff, *up_fwat;
     unsigned char *up_wall;         // whole water.bin when its size differs
     char   tzname[40];              // IANA tz baked in meta.bin (optional tail)
@@ -149,7 +151,6 @@ static GLint u_dbg = -1, u_hs = -1, u_fg = -1, u_fin = -1, u_sib = -1;
 static float g_fg[4] = {1.0f, 0.0f, 0.0f, 0.0f};   // feature gates per slot
 static float g_fin[16];                             // [i*4+j]: slot j finer than i
 static float g_sib[16];                             // [i*4+j]: slots i, j share a scale
-static GLint  u_fe[4] = {-1, -1, -1, -1};
 static GLint u_radpx, u_globec, u_wrap, u_sun, u_sunh, u_snow, u_aur;
 // city lights (lights.bin: world cities for the globe's night side)
 #define MAXLTS 8192
@@ -1493,7 +1494,6 @@ static const char *FRAG =
     // floor + span (metres)
     "uniform vec4 uHs;\n"
     "uniform vec4 uFG;\n"                    // per-slot feature gate (see feat_gates)
-    "uniform vec4 uFE0, uFE1, uFE2, uFE3;\n"  // per-slot bbox edge on screen: left,right,top,bottom
     "uniform mat4 uFin;\n"                   // uFin[i][j] = 1: slot j is finer than slot i
     "uniform mat4 uSib;\n"                   // uSib[i][j] = 1: slots i, j share a scale                  // TOPA_REC_DBG: 1 slot shares, 2-4 slot 0-2 alone
     "uniform sampler2D uTer0, uFW0, uTer1, uFW1, uTer2, uFW2, uTer3, uFW3;\n"
@@ -1578,17 +1578,6 @@ static const char *FRAG =
     "  vec2 o=max(-uv, uv-1.0)/max(fw, vec2(1e-12));\n"   // px outside
     "  float tail=1e-4*(1.0-smoothstep(0.0, 2.0, max(o.x, o.y)));\n"
     "  return max(1.0-smoothstep(0.0, 1.0, d), tail); }\n"
-    // features fade over a wide band (a quarter of the screen height) from each
-    // bbox edge that is ON screen (fe = 0 for edges at or past the screen
-    // border, so an idle view touching its pack's edge loses nothing): a
-    // road network then thins out toward a pack's edge instead of stopping
-    // at a straight line
-    "float featCov(vec2 uv, vec4 fe){\n"
-    "  vec2 fw=max(fwidth(uv), vec2(1e-12));\n"
-    "  float wd=0.25*uRes.y;\n"
-    "  vec4 d=vec4(uv.x/fw.x, (1.0-uv.x)/fw.x, (1.0-uv.y)/fw.y, uv.y/fw.y);\n"
-    "  vec4 f=mix(vec4(1.0), smoothstep(vec4(0.0), vec4(wd), d), fe);\n"
-    "  return f.x*f.y*f.z*f.w; }\n"
     // one contour family: line intensity at step s for absolute metres hm,
     // with the fwidth anti-moiré damper doubling as the data-quality floor
     // (families too fine for a slot's texels self-suppress)
@@ -1771,8 +1760,7 @@ static const char *FRAG =
     "      float v=(1.0-f.x*gc.x)*(1.0-f.y*gc.y)*(1.0-f.z*gc.z)*(1.0-f.w*gc.w);\n"
     "      if(i==0) sup.x=v; else if(i==1) sup.y=v; else if(i==2) sup.z=v; else sup.w=v;\n"
     "    }\n"
-    "    vec4 fcv=vec4(featCov(uv0, uFE0), featCov(uv1, uFE1), featCov(uv2, uFE2), featCov(uv3, uFE3));\n"
-    "    vec4 ka=gc*sup*sib*fcv;\n"
+    "    vec4 ka=gc*sup*sib;\n"
     "    vec4 aL=ka*vec4(fa0.x, fa1.x, fa2.x, fa3.x);\n"
     "    vec4 aA=ka*vec4(fa0.y, fa1.y, fa2.y, fa3.y);\n"
     "    float tL=dot(aL, vec4(1.0)), tA=dot(aA, vec4(1.0));\n"
@@ -1936,10 +1924,6 @@ void engine_gl_init(void) {
     u_fg      = glGetUniformLocation(prog, "uFG");
     u_fin     = glGetUniformLocation(prog, "uFin");
     u_sib     = glGetUniformLocation(prog, "uSib");
-    {
-        static const char *fen[4] = { "uFE0", "uFE1", "uFE2", "uFE3" };
-        for (int i = 0; i < 4; i++) u_fe[i] = glGetUniformLocation(prog, fen[i]);
-    }
     u_globec  = glGetUniformLocation(prog, "uGlobeC");
     u_sun     = glGetUniformLocation(prog, "uSun");
     u_sunh    = glGetUniformLocation(prog, "uSunH");
@@ -2468,11 +2452,18 @@ static void step_world(void) {
     if (gg >= 0 && !packs[gg].gl_ok) { gg = -1; w2v = 0.0; }
     s_slotpk[0] = a; s_slotpk[1] = b; s_slotpk[2] = gg; s_slotpk[3] = cont;
     g_w0v = (float)w0v; g_w1v = (float)w1v; g_w2v = (float)w2v; g_w3v = (float)w3v;
-    // FEATURE GATES (shader feature layer): a slot's roads/lifts/borders ink
-    // once its scale group covers most of the view (fine-only roads never
-    // show as a rectangle) and fade with its weight (nothing inks as it
-    // leaves the slots). uFin orders the slots by scale for the hand-over.
+    // FEATURE GATES (shader feature layer): a slot's roads/lifts/borders
+    // ink only once its scale group covers (nearly) the whole view, then
+    // the whole network fades in at once, eased over ~0.5 s per pack (out
+    // over ~0.15 s), and fades with the slot's weight (nothing inks as it
+    // leaves the slots). Coarser rungs carry no roads, so a road shown while
+    // its pack covers part of the view must end on screen: a box of roads,
+    // or roads thinning out mid-screen if faded spatially. Both read as
+    // false; appearing in time does not. uFin orders the slots by scale for
+    // the hand-over to finer packs, uSib splits sibling overlaps.
     {
+        float tgt[MAXPACKS];
+        for (int i = 0; i < n_packs; i++) tgt[i] = 0.0f;
         double wvs[4] = { w0v, b != a ? w1v : 0.0, w2v, w3v };
         for (int i = 0; i < 4; i++) {
             int pi = s_slotpk[i];
@@ -2493,7 +2484,9 @@ static void step_world(void) {
                                      vx0, vy0, vx1, vy1, varea);
             }
             if (packs[pi].msx > 0.999) uni = 1.0;
-            g_fg[i] = (float)(smooth01((uni - 0.7) / 0.3) * smooth01(wvs[i] / 0.15));
+            float t = (float)smooth01((uni - 0.9) / 0.1);
+            if (t > tgt[pi]) tgt[pi] = t;
+            g_fg[i] = (float)smooth01(wvs[i] / 0.15);     // x the eased gate below
             for (int j = 0; j < 4; j++) {
                 int pj = s_slotpk[j];
                 if (j != i && pj >= 0 && pj != pi && packs[pj].msy < gm * 0.95)
@@ -2502,6 +2495,12 @@ static void step_world(void) {
                     g_sib[i * 4 + j] = 1.0f;
             }
         }
+        float kin = 1.0f - expf((float)(-dt / 0.5)), kout = 1.0f - expf((float)(-dt / 0.15));
+        for (int i = 0; i < n_packs; i++) {
+            float d = tgt[i] - packs[i].fcov;
+            packs[i].fcov += d * (d > 0.0f ? kin : kout);
+        }
+        for (int i = 0; i < 4; i++) if (s_slotpk[i] >= 0) g_fg[i] *= packs[s_slotpk[i]].fcov;
         for (int i = 0; i < 4; i++)              // a pack doubled into two slots inks once
             for (int j = 0; j < i; j++) if (s_slotpk[j] == s_slotpk[i]) g_fg[i] = 0.0f;
     }
@@ -3071,19 +3070,6 @@ void engine_render(int w, int h, int primary) {
     glUniform4fv(u_fg, 1, g_fg);
     glUniformMatrix4fv(u_fin, 1, GL_FALSE, g_fin);
     glUniformMatrix4fv(u_sib, 1, GL_FALSE, g_sib);
-    {   // which slot bbox edges are on screen, eased in over 40 px of inset
-        double hx = cam_h * g_ar * 0.5, hy = cam_h * 0.5;
-        double vx0 = cam_x - hx, vy0 = cam_y - hy, vw = 2.0 * hx, vh = 2.0 * hy;
-        for (int i = 0; i < 4; i++) {
-            struct pack *p = s_slotpk[i] >= 0 ? &packs[s_slotpk[i]] : NULL;
-            if (!p || p->msx > 0.999) { glUniform4f(u_fe[i], 0.0f, 0.0f, 0.0f, 0.0f); continue; }
-            double in[4] = { (p->mx0 - vx0) / vw * w, (vx0 + vw - p->mx0 - p->msx) / vw * w,
-                             (p->my0 - vy0) / vh * h, (vy0 + vh - p->my0 - p->msy) / vh * h };
-            float fe[4];
-            for (int k = 0; k < 4; k++) fe[k] = (float)smooth01(in[k] / 40.0);
-            glUniform4fv(u_fe[i], 1, fe);
-        }
-    }
     // ortho sphere radius: centre ground scale == old planar mapping exactly
     g_radpx = (double)h / (cam_h * 2.0 * M_PI * cos(g_glat));
     glUniform1f(u_radpx, (float)g_radpx);
