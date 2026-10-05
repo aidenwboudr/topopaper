@@ -108,6 +108,12 @@ struct pack {
     int    lab_ax[PKMAX], lab_ay[PKMAX];
     int    lab_rx[PKMAX], lab_ry[PKMAX], lab_rw[PKMAX], lab_rh[PKMAX];
     float  lab_vis[PKMAX];          // eased declutter gate (label authority)
+    // streaming upload (pack_stream): stage 0 idle, 1 terrain rows,
+    // 2 features+water rows, 3 labels; files stay open between frames
+    int    up_stage, up_row, fw_w, fw_h, wat_w, wat_h;
+    float  fade;                    // eases 0 -> 1 once resident (weights x fade)
+    FILE  *up_ft, *up_ff, *up_fwat;
+    unsigned char *up_wall;         // whole water.bin when its size differs
     char   tzname[40];              // IANA tz baked in meta.bin (optional tail)
     int    tz_min; long tz_when;    // cached utc-offset minutes + stamp
 };
@@ -604,26 +610,6 @@ static int pick_initial(int late) {
     return n_lad > 0 ? lad[n_lad - 1] : -1;
 }
 
-static unsigned char *read_bin(const char *path, const char *magic,
-                               unsigned int *w, unsigned int *h) {
-    FILE *f = fopen(path, "rb");
-    if (!f) return NULL;
-    char m[8];
-    if (fread(m, 1, 8, f) != 8 || memcmp(m, magic, 8) != 0 ||
-        fread(w, 4, 1, f) != 1 || fread(h, 4, 1, f) != 1 ||
-        *w == 0 || *h == 0 || *w > 8192 || *h > 8192) {
-        fprintf(stderr, "topopaper: bad %s\n", path); fclose(f); return NULL;
-    }
-    size_t nb = (size_t)*w * *h * 2;
-    unsigned char *buf = malloc(nb);
-    if (!buf || fread(buf, 1, nb, f) != nb) {
-        fprintf(stderr, "topopaper: truncated %s\n", path);
-        free(buf); fclose(f); return NULL;
-    }
-    fclose(f);
-    return buf;
-}
-
 static void upload_la(GLuint tex, int unit, int w, int h,
                       const unsigned char *data, GLint filter) {
     glActiveTexture(GL_TEXTURE0 + unit);
@@ -855,64 +841,167 @@ static void chip_sync(double t) {
 // Load a pack's textures + labels (GL context must be current). Resident once
 // loaded — the ladder rebinds freely without re-uploading — until the LRU
 // cap (packs_gl_maint) evicts it.
+static void pack_gl_free(int idx);
+
+// ---- streaming uploads -------------------------------------------------------
+// A pack's textures go up in row strips (glTexSubImage2D) under a per-frame
+// byte budget, so no frame stalls on a whole pack: a flight queues the packs
+// its path will draw on in the order it reaches them (start_flight) and
+// stream_tick() feeds them in between frames. ensure_pack_gl() finishes a
+// pending pack at once: the backstop for anything not predicted.
+static void stream_close(struct pack *p) {
+    if (p->up_ft) fclose(p->up_ft);
+    if (p->up_ff) fclose(p->up_ff);
+    if (p->up_fwat) fclose(p->up_fwat);
+    free(p->up_wall);
+    p->up_ft = p->up_ff = p->up_fwat = NULL;
+    p->up_wall = NULL;
+    p->up_stage = 0;
+}
+
+static FILE *open_bin(const char *name, const char *file, const char *magic,
+                      unsigned int *w, unsigned int *h) {
+    char path[768];
+    snprintf(path, sizeof path, "%s/%s/%s", areas_dir, name, file);
+    FILE *f = fopen(path, "rb");
+    if (!f) return NULL;
+    char m[8];
+    if (fread(m, 1, 8, f) != 8 || memcmp(m, magic, 8) != 0 ||
+        fread(w, 4, 1, f) != 1 || fread(h, 4, 1, f) != 1 ||
+        *w == 0 || *h == 0 || *w > 8192 || *h > 8192) {
+        fprintf(stderr, "topopaper: bad %s\n", path); fclose(f); return NULL;
+    }
+    return f;
+}
+
+static void pack_finish(int idx);
+
+// Advance pack idx's upload by about `budget` bytes. 1 = resident, 0 = still
+// going, -1 = unusable (marked bad and off the ladder).
+static int pack_stream(int idx, size_t budget) {
+    struct pack *p = &packs[idx];
+    if (!p->have || p->bad) return -1;
+    if (p->gl_ok) return 1;
+    if (p->up_stage == 0) {
+        // open everything, validate, allocate the textures (cheap)
+        unsigned int tw, th, fw = 0, fh = 0, ww = 0, wh = 0;
+        p->up_ft = open_bin(p->name, "terrain.bin", "TOPOTER1", &tw, &th);
+        if (!p->up_ft) {
+            fprintf(stderr, "topopaper: pack '%s' has no usable terrain.bin, skipping it\n",
+                    p->name);
+            p->bad = 1;
+            g_lad_dirty = 1;
+            return -1;
+        }
+        p->ter_w = (int)tw; p->ter_h = (int)th;
+        // features (roads/runs L, lifts/borders A) and water (signed shore
+        // distance) share one RGB texture, so four slots fit the GLES2
+        // texture-unit budget. Builders write both at the terrain's size; a
+        // pack whose sizes differ gets its water resampled onto the features.
+        p->up_ff = open_bin(p->name, "features.bin", "TOPORDS1", &fw, &fh);
+        if (!p->up_ff) { fw = fh = 0; p->stL[5] = p->stA[5] = 0.0f; }
+        p->up_fwat = open_bin(p->name, "water.bin", "TOPOWTR1", &ww, &wh);
+        if (!p->up_fwat) ww = wh = 0;
+        if (!fw) { fw = ww ? ww : 1; fh = wh ? wh : 1; }
+        if (p->up_fwat && (ww != fw || wh != fh)) {
+            p->up_wall = malloc((size_t)ww * wh);
+            if (!p->up_wall || fread(p->up_wall, 1, (size_t)ww * wh, p->up_fwat) != (size_t)ww * wh) {
+                free(p->up_wall); p->up_wall = NULL; ww = wh = 0;
+            }
+            fclose(p->up_fwat); p->up_fwat = NULL;
+        }
+        p->fw_w = (int)fw; p->fw_h = (int)fh; p->wat_w = (int)ww; p->wat_h = (int)wh;
+        glGenTextures(1, &p->ter_tex);
+        upload_la(p->ter_tex, UNIT_TER[0], (int)tw, (int)th, NULL, GL_NEAREST);
+        glGenTextures(1, &p->fw_tex);
+        upload_rgb(p->fw_tex, UNIT_FW[0], (int)fw, (int)fh, NULL);
+        glActiveTexture(GL_TEXTURE0);
+        p->up_stage = 1; p->up_row = 0;
+    }
+    static unsigned char *buf = NULL, *buf2 = NULL;
+    static size_t cap = 0;
+    while (p->up_stage == 1 || p->up_stage == 2) {
+        int w = p->up_stage == 1 ? p->ter_w : p->fw_w;
+        int h = p->up_stage == 1 ? p->ter_h : p->fw_h;
+        size_t rowb = (size_t)w * (p->up_stage == 1 ? 2 : 3);
+        int n = (int)(budget / rowb);
+        if (n < 1) n = 1;
+        if (n > h - p->up_row) n = h - p->up_row;
+        if (cap < rowb * n) {
+            cap = rowb * n;
+            buf = realloc(buf, cap); buf2 = realloc(buf2, cap);
+            if (!buf || !buf2) { cap = 0; return 0; }
+        }
+        if (p->up_stage == 1) {
+            if (fread(buf, rowb, (size_t)n, p->up_ft) != (size_t)n) {
+                fprintf(stderr, "topopaper: truncated terrain.bin in '%s', skipping it\n", p->name);
+                stream_close(p);
+                pack_gl_free(idx);
+                p->bad = 1; g_lad_dirty = 1;
+                return -1;
+            }
+            glActiveTexture(GL_TEXTURE0 + UNIT_TER[0]);
+            glBindTexture(GL_TEXTURE_2D, p->ter_tex);
+            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, p->up_row, w, n,
+                            GL_LUMINANCE_ALPHA, GL_UNSIGNED_BYTE, buf);
+        } else {
+            // features (L,A) + water -> RGB rows; anything missing reads as
+            // "far from everything" / dry
+            size_t nf = (size_t)w * n;
+            int have_f = p->up_ff && fread(buf2, 2, nf, p->up_ff) == nf;
+            if (!have_f && p->up_ff) { fclose(p->up_ff); p->up_ff = NULL; }
+            unsigned char *wr = buf2 + nf * 2;   // water row bytes after features
+            int have_w = 0;
+            if (p->up_fwat) {
+                have_w = fread(wr, 1, nf, p->up_fwat) == nf;
+                if (!have_w) { fclose(p->up_fwat); p->up_fwat = NULL; }
+            }
+            for (int y = 0; y < n; y++)
+                for (int x = 0; x < w; x++) {
+                    size_t o = (size_t)y * w + x;
+                    unsigned char *d = buf + o * 3;
+                    d[0] = have_f ? buf2[o * 2] : 255;
+                    d[1] = have_f ? buf2[o * 2 + 1] : 255;
+                    if (have_w) d[2] = wr[o];
+                    else if (p->up_wall)
+                        d[2] = p->up_wall[(size_t)((p->up_row + y) * p->wat_h / h) * p->wat_w
+                                          + (size_t)x * p->wat_w / w];
+                    else d[2] = 255;
+                }
+            glActiveTexture(GL_TEXTURE0 + UNIT_FW[0]);
+            glBindTexture(GL_TEXTURE_2D, p->fw_tex);
+            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, p->up_row, w, n,
+                            GL_RGB, GL_UNSIGNED_BYTE, buf);
+        }
+        glActiveTexture(GL_TEXTURE0);
+        p->up_row += n;
+        if (p->up_row >= h) { p->up_stage++; p->up_row = 0; }
+        size_t used = rowb * n;
+        if (used >= budget) return p->up_stage == 3 ? (pack_finish(idx), 1) : 0;
+        budget -= used;
+    }
+    pack_finish(idx);
+    return 1;
+}
+
 static int ensure_pack_gl(int idx) {
     struct pack *p = &packs[idx];
     if (!p->have || p->bad) return 0;
     p->last_used = now_sec();
     if (p->gl_ok) return 1;
+    double t_up = mono_sec();
+    int r = pack_stream(idx, (size_t)-1);
+    if (r == 1) p->fade = 1.0f;              // needed now: no fade-in
+    if (r == 1 && fly_active)                // the prefetch missed it: a stall
+        fprintf(stderr, "topopaper: '%s' loaded on demand mid-flight (%.0f ms)\n",
+                p->name, (mono_sec() - t_up) * 1000.0);
+    return r == 1;
+}
+
+// labels + wrap mode, then the pack is resident
+static void pack_finish(int idx) {
+    struct pack *p = &packs[idx];
     char path[768];
-    snprintf(path, sizeof path, "%s/%s/terrain.bin", areas_dir, p->name);
-    unsigned int tw, th;
-    unsigned char *ter = read_bin(path, "TOPOTER1", &tw, &th);
-    if (!ter) {
-        fprintf(stderr, "topopaper: pack '%s' has no usable terrain.bin, skipping it\n",
-                p->name);
-        p->bad = 1;
-        g_lad_dirty = 1;
-        return 0;
-    }
-    glGenTextures(1, &p->ter_tex);
-    upload_la(p->ter_tex, UNIT_TER[0], tw, th, ter, GL_NEAREST);
-    free(ter);
-    p->ter_w = (int)tw; p->ter_h = (int)th;
-
-    // features (roads/runs L, lifts/borders A) and water (signed shore
-    // distance) share one RGB texture, so all three slots fit the GLES2
-    // texture-unit budget. Builders write both at the terrain's size; a
-    // pack whose sizes differ gets its water resampled onto the features.
-    snprintf(path, sizeof path, "%s/%s/features.bin", areas_dir, p->name);
-    unsigned int fw = 1, fh = 1, ww = 0, wh = 0;
-    unsigned char *feat = read_bin(path, "TOPORDS1", &fw, &fh);
-    if (!feat) { fw = fh = 1; p->stL[5] = p->stA[5] = 0.0f; }
-    unsigned char *wb = NULL;
-    snprintf(path, sizeof path, "%s/%s/water.bin", areas_dir, p->name);
-    FILE *wf = fopen(path, "rb");
-    if (wf) {
-        char wm[8];
-        if (fread(wm, 1, 8, wf) == 8 && !memcmp(wm, "TOPOWTR1", 8) &&
-            fread(&ww, 4, 1, wf) == 1 && fread(&wh, 4, 1, wf) == 1 &&
-            ww > 0 && wh > 0 && ww <= 8192 && wh <= 8192) {
-            size_t nb = (size_t)ww * wh;
-            wb = malloc(nb);
-            if (wb && fread(wb, 1, nb, wf) != nb) { free(wb); wb = NULL; }
-        }
-        fclose(wf);
-    }
-    if (!feat && wb) { fw = ww; fh = wh; }   // water only: its own size
-    unsigned char *fwb = malloc((size_t)fw * fh * 3);
-    if (fwb) {
-        for (unsigned int y = 0; y < fh; y++)
-            for (unsigned int x = 0; x < fw; x++) {
-                size_t o = (size_t)y * fw + x;
-                fwb[o * 3 + 0] = feat ? feat[o * 2 + 0] : 255;
-                fwb[o * 3 + 1] = feat ? feat[o * 2 + 1] : 255;
-                fwb[o * 3 + 2] = wb ? wb[(size_t)(y * wh / fh) * ww + x * ww / fw] : 255;
-            }
-        glGenTextures(1, &p->fw_tex);
-        upload_rgb(p->fw_tex, UNIT_FW[0], (int)fw, (int)fh, fwb);
-    }
-    free(fwb); free(feat); free(wb);
-
     p->n_lab = 0;
     snprintf(path, sizeof path, "%s/%s/labels.bin", areas_dir, p->name);
     FILE *f = fopen(path, "rb");
@@ -970,21 +1059,23 @@ static int ensure_pack_gl(int idx) {
         }
     }
     glActiveTexture(GL_TEXTURE0);
+    stream_close(p);
     p->gl_ok = 1;
     fprintf(stderr, "topopaper: resident '%s' %dx%d step %.0fm %d labels\n",
             p->name, p->ter_w, p->ter_h, p->step, p->n_lab);
-    return 1;
 }
 
 static void pack_gl_free(int idx) {
     struct pack *p = &packs[idx];
-    if (!p->gl_ok) return;
+    if (p->up_stage) stream_close(p);
+    else if (!p->gl_ok) return;
     GLuint t[3] = { p->ter_tex, p->fw_tex, p->atlas_tex };
     for (int i = 0; i < 3; i++) if (t[i]) glDeleteTextures(1, &t[i]);
     p->ter_tex = p->fw_tex = p->atlas_tex = 0;
     p->n_lab = 0;
     memset(p->lab_vis, 0, sizeof p->lab_vis);
     p->gl_ok = 0;
+    p->fade = 0.0f;
 }
 
 // Once per tick (GL current): re-upload packs rebuilt on disk, release the
@@ -1060,6 +1151,41 @@ static void idle_cam(int idx, double *ox, double *oy, double *oh) {
 
 // van Wijk & Nuij "Smooth and efficient zooming and panning" (2003):
 // the optimal pan+zoom path between two camera rects, parameterized by s.
+static int ladder_weights(double cx, double cy, double ch, double *ovl,
+                          int *idxw, double *wsl, double *wlf);
+static int view_container(double cx, double cy, double ch);
+static int pack_stream(int idx, size_t budget);
+static void flight_cam(double s, double *ox, double *oy, double *oh);
+static int g_preq[MAXRES], g_npreq = 0;    // flight prefetch, in need order
+
+// One frame's share of the prefetch: upload ~STREAM_BUDGET bytes of the
+// first queued packs not yet resident (they stay protected from the LRU
+// for the flight via last_used).
+#define STREAM_BUDGET (3u << 20)
+// queue a pack for streaming; urgent = ahead of everything (in view now)
+static void stream_want(int idx, int urgent) {
+    int at = -1;
+    for (int j = 0; j < g_npreq; j++) if (g_preq[j] == idx) at = j;
+    if (at >= 0 && !urgent) return;
+    if (at < 0) {
+        if (g_npreq >= MAXRES) return;
+        at = g_npreq++;
+    }
+    for (int j = at; j > 0 && urgent; j--) g_preq[j] = g_preq[j - 1];
+    if (urgent) g_preq[0] = idx; else g_preq[at] = idx;
+}
+
+static void stream_tick(void) {
+    size_t budget = STREAM_BUDGET;
+    for (int j = 0; j < g_npreq && budget > 0; j++) {
+        struct pack *p = &packs[g_preq[j]];
+        p->last_used = now_sec();
+        if (p->gl_ok || p->bad || !p->have) continue;
+        pack_stream(g_preq[j], budget);
+        budget = 0;                          // one pack per frame
+    }
+}
+
 static void start_flight(int tgt) {
     fly_tgt = tgt;
     g_fly_start = now_sec();
@@ -1077,26 +1203,6 @@ static void start_flight(int tgt) {
         ph_pb = asin(s);
     }
     idle_cam(tgt, &f_c1x, &f_c1y, &f_w1);
-    {
-        // every rung between here and there that lies along the way renders
-        // mid-dive — make those resident up front (the corridor test keeps a
-        // big registry from uploading same-scale packs on other continents;
-        // anything missed still loads on demand when it enters the view)
-        int a = ladder_pos(p_cur), b = ladder_pos(tgt);
-        if (a < 0) a = b;
-        int klo = a < b ? a : b, khi = a > b ? a : b, n = 0;
-        double m = 0.5 * (f_w0 > f_w1 ? f_w0 : f_w1) * g_ar;
-        double rx0 = (f_c0x < f_c1x ? f_c0x : f_c1x) - m;
-        double rx1 = (f_c0x > f_c1x ? f_c0x : f_c1x) + m;
-        double ry0 = (f_c0y < f_c1y ? f_c0y : f_c1y) - m;
-        double ry1 = (f_c0y > f_c1y ? f_c0y : f_c1y) + m;
-        for (int k = klo; k >= 0 && k <= khi && n < MAXRES - 4; k++) {
-            struct pack *p = &packs[lad[k]];
-            if (p->mx0 > rx1 || p->mx0 + p->msx < rx0 ||
-                p->my0 > ry1 || p->my0 + p->msy < ry0) continue;
-            if (ensure_pack_gl(lad[k])) n++;
-        }
-    }
     double dx = f_c1x - f_c0x, dy = f_c1y - f_c0y;
     f_d = sqrt(dx * dx + dy * dy);
     if (f_d < 1e-12) {
@@ -1129,6 +1235,27 @@ static void start_flight(int tgt) {
     fly_t = 0.0;
     fly_active = 1;
     g_vis = 0.0; roam_next = -1.0;           // roam clock restarts per flight
+    // PREFETCH: walk the path through the weight law and queue every pack
+    // it will draw on (and each view's coverage container) in the order the
+    // flight reaches them; stream_tick() uploads them between frames
+    {
+        static double ov[MAXPACKS], ws[MAXPACKS], lf[MAXPACKS];
+        static int id[MAXPACKS];
+        g_npreq = 0;
+        for (int i = 0; i <= 120 && g_npreq < MAXRES - 4; i++) {
+            double x, y, h;
+            flight_cam(f_S * i / 120.0, &x, &y, &h);
+            int n = ladder_weights(x, y, h, ov, id, ws, lf);
+            for (int k = 0; k <= n; k++) {
+                int pk = k < n ? id[k] : view_container(x, y, h);
+                if (k < n && ws[k] < 0.02) continue;     // slivers: never drawn
+
+                int seen = 0;
+                for (int j = 0; j < g_npreq; j++) if (g_preq[j] == pk) seen = 1;
+                if (!seen && g_npreq < MAXRES - 4) g_preq[g_npreq++] = pk;
+            }
+        }
+    }
     fprintf(stderr, "topopaper: flight %s -> %s  S=%.2f T=%.1fs\n",
             packs[p_cur].name, packs[tgt].name, f_S, fly_T);
 }
@@ -1912,6 +2039,168 @@ static void theme_feat(const float *baked, float *out) {
     memcpy(out, baked, 3 * sizeof(float));
 }
 
+// The weight law for a camera (centre cx,cy, view height ch): fills ovl[]
+// (view overlap per ladder rung) and the weighted packs idxw[]/wsl[] with
+// their label factors wlf[]; returns how many. step_world() draws with it,
+// start_flight() predicts a flight's packs with it.
+//
+// Candidates = packs whose bbox intersects the VIEW rectangle: a sibling
+// pack at the same scale but elsewhere on the map (Tetons vs Wind
+// Rivers) must never blend in by height alone, while a flight corridor
+// naturally picks up each area the camera overflies. When nothing
+// qualifies (a lone remote pack), fall back to the nearest centre.
+// Every rung's weight is a continuous function of camera state. Drivers:
+//  - SHARPNESS YIELD: a rung hands off only as the NEXT rung's texels
+//    approach 1 screen px — sharp-for-sharp swaps are invisible at any
+//    screen size. (The old arrival-height bands completed while the
+//    coarse rung was still ~1.8x magnified: visible softening, detail
+//    loading out while it was still significant.) The yield is
+//    scaled by the next rung's own view overlap, so a sliver pack
+//    (yellowstone-region clipping a glacier descent) can't pull the
+//    handoff early.
+//  - VIEW OVERLAP: weight scales with the fraction of the view covered —
+//    slivers never claim the blend; packs fade out BEFORE their bbox
+//    exits the view (no candidacy-exit pops).
+// Weights telescope fine->coarse; the leftover coverage deficit flows
+// upward and lands on whatever covers.
+static int ladder_weights(double cx, double cy, double ch, double *ovl,
+                          int *idxw, double *wsl, double *wlf) {
+    double hxv = ch * g_ar * 0.5, hyv = ch * 0.5;
+    double vx0 = cx - hxv, vx1 = cx + hxv;
+    double vy0 = cy - hyv, vy1 = cy + hyv;
+    double varea = (vx1 - vx0) * (vy1 - vy0);
+    for (int k = 0; k < n_lad; k++) {
+        struct pack *p = &packs[lad[k]];
+        double ox0 = p->mx0 > vx0 ? p->mx0 : vx0;
+        double oy0 = p->my0 > vy0 ? p->my0 : vy0;
+        double ox1 = p->mx0 + p->msx < vx1 ? p->mx0 + p->msx : vx1;
+        double oy1 = p->my0 + p->msy < vy1 ? p->my0 + p->msy : vy1;
+        ovl[k] = (ox1 > ox0 && oy1 > oy0)
+                 ? (ox1 - ox0) * (oy1 - oy0) / varea : 0.0;
+    }
+    // ---- SIBLING LAW --------------------------------------------------------
+    // Rungs of one scale are one LAYER. The ladder is walked in scale GROUPS
+    // (msy within 5%); inside a group the members split the group's take by
+    // TERRITORY: the member whose centre is nearest the camera (in units of
+    // its own size) leads and takes its whole view coverage, the others take
+    // only the coverage they ADD past the leaders' edges. Before this, every
+    // same-scale pack covering the view took its full coverage in ladder
+    // (= qsort) order — isle-royale-region drew level with apostle-islands-
+    // region over the Apostles (two rosters, two waters, one screen) — and
+    // the sharpness yield consulted lad[k+1], usually a same-scale STRANGER
+    // with no view overlap, so the yield was dead and hand-offs fell back
+    // to coverage loss. The yield now looks at the next COARSER covering
+    // group. Preference is soft (the two leaders blend where territories
+    // meet) so every weight stays continuous in camera state. Labels follow
+    // territory: a member that only fills a sliver keeps its roster down
+    // (label factor = share of its own coverage it won).
+    int nslw = 0;
+    double rem = 1.0;
+    int gk = 0;
+    while (gk < n_lad && rem > 1e-4) {
+        int g0 = gk; double gm = packs[lad[g0]].msy;
+        while (gk < n_lad && packs[lad[gk]].msy < gm * 1.05) gk++;   // group [g0,gk)
+        int mem[MAXSIB], nm = 0;
+        for (int k = g0; k < gk && nm < MAXSIB; k++) if (ovl[k] > 0.0) mem[nm++] = k;
+        if (!nm) continue;
+        double yield = 0.0;                  // next coarser COVERING group
+        for (int h0 = gk; h0 < n_lad; ) {
+            double hm = packs[lad[h0]].msy; int h1 = h0, best = -1;
+            double bo = 0.0, uni = 0.0;
+            while (h1 < n_lad && packs[lad[h1]].msy < hm * 1.05) {
+                if (ovl[h1] > bo) { bo = ovl[h1]; best = h1; }
+                uni += ovl[h1]; h1++;
+            }
+            if (best >= 0) {
+                struct pack *q = &packs[lad[best]];
+                double hs = q->msy * ((double)g_scr_h / (double)(q->ter_h > 0 ? q->ter_h : 2048));
+                if (hs > 1e-12) {
+                    yield = smooth01(log(ch / hs) / log(1.6));
+                    if (uni > 1.0) uni = 1.0;
+                    double os = uni / 0.5;       // sliver yieldee -> hold on
+                    if (os < 1.0) yield *= os;
+                }
+                break;
+            }
+            h0 = h1;
+        }
+        double tt = rem * (1.0 - yield);
+        double pref[MAXSIB], gov[MAXSIB], gpo[MAXSIB][MAXSIB];
+        for (int i = 0; i < nm; i++) {
+            struct pack *p = &packs[lad[mem[i]]];
+            double sig = 0.5 * (p->msx < p->msy ? p->msx : p->msy);
+            double ddx = cx - (p->mx0 + p->msx * 0.5);
+            double ddy = cy - (p->my0 + p->msy * 0.5);
+            if (p->msx > 0.999) { ddx = 0.0; ddy = 0.0; }   // world packs own everything
+            pref[i] = exp(-(ddx * ddx + ddy * ddy) / (sig * sig));
+        }
+        for (int i = 1; i < nm; i++) {       // order by preference (nm is tiny)
+            int t = mem[i]; double pt = pref[i]; int j = i - 1;
+            while (j >= 0 && pref[j] < pt) { mem[j+1] = mem[j]; pref[j+1] = pref[j]; j--; }
+            mem[j+1] = t; pref[j+1] = pt;
+        }
+        for (int i = 0; i < nm; i++) {
+            gov[i] = ovl[mem[i]];
+            for (int j = 0; j < nm; j++)
+                gpo[i][j] = (i == j) ? gov[i]
+                          : rect_ovl3(&packs[lad[mem[i]]], &packs[lad[mem[j]]],
+                                      vx0, vy0, vx1, vy1, varea);
+        }
+        int ord[MAXSIB]; for (int i = 0; i < nm; i++) ord[i] = i;
+        double takeA[MAXSIB], takeB[MAXSIB];
+        alloc_terr(nm, ord, gov, gpo, tt, takeA);
+        double s = 1.0;                      // soft swap of the two leaders
+        if (nm >= 2) {
+            double x = (pref[0] - pref[1]) / (0.35 * (pref[0] + pref[1]) + 1e-12);
+            s = 0.5 + 0.5 * smooth01(x);     // tie -> 50/50, clearly apart -> pure order
+            if (s < 0.999) {
+                ord[0] = 1; ord[1] = 0;
+                alloc_terr(nm, ord, gov, gpo, tt, takeB);
+            }
+        }
+        for (int i = 0; i < nm; i++) {
+            double take = (s < 0.999) ? s * takeA[i] + (1.0 - s) * takeB[i] : takeA[i];
+            if (take > 1e-4) {
+                wsl[nslw] = take; idxw[nslw] = lad[mem[i]];
+                double own = tt * gov[i];
+                wlf[nslw] = own > 1e-9 ? take / own : 0.0;
+                if (wlf[nslw] > 1.0) wlf[nslw] = 1.0;
+                nslw++;
+            }
+            rem -= take;
+        }
+    }
+    if (!nslw) {                             // camera outside everything: nearest
+        double best = 1e18; int bi = lad[0];
+        for (int k = 0; k < n_lad; k++) {
+            struct pack *p = &packs[lad[k]];
+            double ddx = cx - (p->mx0 + p->msx * 0.5);
+            double ddy = cy - (p->my0 + p->msy * 0.5);
+            if (ddx*ddx + ddy*ddy < best) { best = ddx*ddx + ddy*ddy; bi = lad[k]; }
+        }
+        wsl[0] = 1.0; idxw[0] = bi; wlf[0] = 1.0; nslw = 1;
+    }
+    return nslw;
+}
+
+// The coverage container for a camera: the finest pack whose bbox holds the
+// whole view (plus a margin for the sphere's curvature) — earth at worst.
+static int view_container(double cx, double cy, double ch) {
+    double vx0 = cx - ch * g_ar * 0.5, vx1 = cx + ch * g_ar * 0.5;
+    double vy0 = cy - ch * 0.5, vy1 = cy + ch * 0.5;
+    // margin ~ the sphere's edge distortion (angular view size squared),
+    // less a hair so an idle view touching its own pack's edge counts
+    double th = ch * 2.0 * M_PI, mf = th * th * 0.25 - 1e-3;
+    if (mf > 0.1) mf = 0.1;
+    double mx = mf * (vx1 - vx0), my = mf * (vy1 - vy0);
+    for (int k = 0; k < n_lad; k++) {                    // fine -> coarse
+        struct pack *p = &packs[lad[k]];
+        if ((p->msx > 0.999 || (p->mx0 <= vx0 - mx && p->mx0 + p->msx >= vx1 + mx)) &&
+            p->my0 <= vy0 - my && p->my0 + p->msy >= vy1 + my) return lad[k];
+    }
+    return lad[n_lad - 1];                               // the coarsest (earth)
+}
+
 // Advance the world by dt. Called once per frame tick, however many outputs
 // then draw that frame (each output stepping it ran the world N times fast).
 static void step_world(void) {
@@ -2019,6 +2308,10 @@ static void step_world(void) {
             cam_h += (ih - f_w1) * dk;
         }
         if (tau >= 1.0) {
+            int m = 0;                       // the flight's prefetch is done
+            for (int j = 0; j < g_npreq; j++)
+                if (!packs[g_preq[j]].gl_ok && !packs[g_preq[j]].bad) g_preq[m++] = g_preq[j];
+            g_npreq = m;
             p_cur = fly_tgt;
             fly_active = 2;
             land_t = 0.0;
@@ -2039,144 +2332,35 @@ static void step_world(void) {
         maybe_roam(dt);
     }
 
-    // ---- ladder pair: rungs bracketing the camera height -------------------
-    // Candidates = packs whose bbox intersects the VIEW rectangle: a sibling
-    // pack at the same scale but elsewhere on the map (Tetons vs Wind
-    // Rivers) must never blend in by height alone, while a flight corridor
-    // naturally picks up each area the camera overflies. When nothing
-    // qualifies (a lone remote pack), fall back to the nearest centre.
-    // ---- LADDER WEIGHTS: continuous by construction (the law) -------------
-    // Every rung's weight is a continuous function of camera state. Drivers:
-    //  - SHARPNESS YIELD: a rung hands off only as the NEXT rung's texels
-    //    approach 1 screen px — sharp-for-sharp swaps are invisible at any
-    //    screen size. (The old arrival-height bands completed while the
-    //    coarse rung was still ~1.8x magnified: visible softening, detail
-    //    loading out while it was still significant.) The yield is
-    //    scaled by the next rung's own view overlap, so a sliver pack
-    //    (yellowstone-region clipping a glacier descent) can't pull the
-    //    handoff early.
-    //  - VIEW OVERLAP: weight scales with the fraction of the view covered —
-    //    slivers never claim the blend; packs fade out BEFORE their bbox
-    //    exits the view (no candidacy-exit pops).
-    // Weights telescope fine->coarse; the leftover coverage deficit flows
-    // upward and lands on whatever covers (the guarantor emerges naturally
-    // in slot 2, rendered terrain-only).
-    double hxv = cam_h * g_ar * 0.5, hyv = cam_h * 0.5;
-    double vx0 = cam_x - hxv, vx1 = cam_x + hxv;
-    double vy0 = cam_y - hyv, vy1 = cam_y + hyv;
+    // ---- ladder weights (the law: see ladder_weights) ----------------------
+    static double ovl[MAXPACKS], wsl[MAXPACKS], wlf[MAXPACKS];
+    static int idxw[MAXPACKS];
+    int nslw = ladder_weights(cam_x, cam_y, cam_h, ovl, idxw, wsl, wlf);
+    // RESIDENCY: only resident packs draw, each fading in over ~0.15 s once
+    // its textures are up. A pack the weight law wants that isn't resident
+    // yet streams in at the front of the queue meanwhile (no frame ever
+    // stalls on it); the coarser packs that cover its ground carry the
+    // picture until it arrives. Only a view left mostly uncovered, or the
+    // coverage container, loads on the spot.
+    {
+        float kf = 1.0f - expf((float)(-dt / 0.15));
+        for (int i = 0; i < n_packs; i++)
+            if (packs[i].gl_ok) packs[i].fade += (1.0f - packs[i].fade) * kf;
+        double tot = 0.0, top = -1.0; int topk = -1;
+        for (int k = 0; k < nslw; k++) {
+            struct pack *p = &packs[idxw[k]];
+            if (wsl[k] > top) { top = wsl[k]; topk = k; }
+            if (!p->gl_ok && wsl[k] > 1e-3) stream_want(idxw[k], 1);
+            wsl[k] *= p->gl_ok ? p->fade : 0.0f;
+            tot += wsl[k];
+        }
+        if (tot < 0.25 && topk >= 0 && !packs[idxw[topk]].gl_ok &&
+            ensure_pack_gl(idxw[topk]))
+            wsl[topk] = top;                 // the backstop: show it now
+    }
+    double vx0 = cam_x - cam_h * g_ar * 0.5, vx1 = cam_x + cam_h * g_ar * 0.5;
+    double vy0 = cam_y - cam_h * 0.5, vy1 = cam_y + cam_h * 0.5;
     double varea = (vx1 - vx0) * (vy1 - vy0);
-    double ovl[MAXPACKS];
-    for (int k = 0; k < n_lad; k++) {
-        struct pack *p = &packs[lad[k]];
-        double ox0 = p->mx0 > vx0 ? p->mx0 : vx0;
-        double oy0 = p->my0 > vy0 ? p->my0 : vy0;
-        double ox1 = p->mx0 + p->msx < vx1 ? p->mx0 + p->msx : vx1;
-        double oy1 = p->my0 + p->msy < vy1 ? p->my0 + p->msy : vy1;
-        ovl[k] = (ox1 > ox0 && oy1 > oy0)
-                 ? (ox1 - ox0) * (oy1 - oy0) / varea : 0.0;
-    }
-    // ---- SIBLING LAW --------------------------------------------------------
-    // Rungs of one scale are one LAYER. The ladder is walked in scale GROUPS
-    // (msy within 5%); inside a group the members split the group's take by
-    // TERRITORY: the member whose centre is nearest the camera (in units of
-    // its own size) leads and takes its whole view coverage, the others take
-    // only the coverage they ADD past the leaders' edges. Before this, every
-    // same-scale pack covering the view took its full coverage in ladder
-    // (= qsort) order — isle-royale-region drew level with apostle-islands-
-    // region over the Apostles (two rosters, two waters, one screen) — and
-    // the sharpness yield consulted lad[k+1], usually a same-scale STRANGER
-    // with no view overlap, so the yield was dead and hand-offs fell back
-    // to coverage loss. The yield now looks at the next COARSER covering
-    // group. Preference is soft (the two leaders blend where territories
-    // meet) so every weight stays continuous in camera state. Labels follow
-    // territory: a member that only fills a sliver keeps its roster down
-    // (label factor = share of its own coverage it won).
-    double wsl[MAXPACKS]; int nslw = 0; int idxw[MAXPACKS]; double wlf[MAXPACKS];
-    double rem = 1.0;
-    int gk = 0;
-    while (gk < n_lad && rem > 1e-4) {
-        int g0 = gk; double gm = packs[lad[g0]].msy;
-        while (gk < n_lad && packs[lad[gk]].msy < gm * 1.05) gk++;   // group [g0,gk)
-        int mem[MAXSIB], nm = 0;
-        for (int k = g0; k < gk && nm < MAXSIB; k++) if (ovl[k] > 0.0) mem[nm++] = k;
-        if (!nm) continue;
-        double yield = 0.0;                  // next coarser COVERING group
-        for (int h0 = gk; h0 < n_lad; ) {
-            double hm = packs[lad[h0]].msy; int h1 = h0, best = -1;
-            double bo = 0.0, uni = 0.0;
-            while (h1 < n_lad && packs[lad[h1]].msy < hm * 1.05) {
-                if (ovl[h1] > bo) { bo = ovl[h1]; best = h1; }
-                uni += ovl[h1]; h1++;
-            }
-            if (best >= 0) {
-                struct pack *q = &packs[lad[best]];
-                double hs = q->msy * ((double)g_scr_h / (double)(q->ter_h > 0 ? q->ter_h : 2048));
-                if (hs > 1e-12) {
-                    yield = smooth01(log(cam_h / hs) / log(1.6));
-                    if (uni > 1.0) uni = 1.0;
-                    double os = uni / 0.5;       // sliver yieldee -> hold on
-                    if (os < 1.0) yield *= os;
-                }
-                break;
-            }
-            h0 = h1;
-        }
-        double tt = rem * (1.0 - yield);
-        double pref[MAXSIB], gov[MAXSIB], gpo[MAXSIB][MAXSIB];
-        for (int i = 0; i < nm; i++) {
-            struct pack *p = &packs[lad[mem[i]]];
-            double sig = 0.5 * (p->msx < p->msy ? p->msx : p->msy);
-            double ddx = cam_x - (p->mx0 + p->msx * 0.5);
-            double ddy = cam_y - (p->my0 + p->msy * 0.5);
-            if (p->msx > 0.999) { ddx = 0.0; ddy = 0.0; }   // world packs own everything
-            pref[i] = exp(-(ddx * ddx + ddy * ddy) / (sig * sig));
-        }
-        for (int i = 1; i < nm; i++) {       // order by preference (nm is tiny)
-            int t = mem[i]; double pt = pref[i]; int j = i - 1;
-            while (j >= 0 && pref[j] < pt) { mem[j+1] = mem[j]; pref[j+1] = pref[j]; j--; }
-            mem[j+1] = t; pref[j+1] = pt;
-        }
-        for (int i = 0; i < nm; i++) {
-            gov[i] = ovl[mem[i]];
-            for (int j = 0; j < nm; j++)
-                gpo[i][j] = (i == j) ? gov[i]
-                          : rect_ovl3(&packs[lad[mem[i]]], &packs[lad[mem[j]]],
-                                      vx0, vy0, vx1, vy1, varea);
-        }
-        int ord[MAXSIB]; for (int i = 0; i < nm; i++) ord[i] = i;
-        double takeA[MAXSIB], takeB[MAXSIB];
-        alloc_terr(nm, ord, gov, gpo, tt, takeA);
-        double s = 1.0;                      // soft swap of the two leaders
-        if (nm >= 2) {
-            double x = (pref[0] - pref[1]) / (0.35 * (pref[0] + pref[1]) + 1e-12);
-            s = 0.5 + 0.5 * smooth01(x);     // tie -> 50/50, clearly apart -> pure order
-            if (s < 0.999) {
-                ord[0] = 1; ord[1] = 0;
-                alloc_terr(nm, ord, gov, gpo, tt, takeB);
-            }
-        }
-        for (int i = 0; i < nm; i++) {
-            double take = (s < 0.999) ? s * takeA[i] + (1.0 - s) * takeB[i] : takeA[i];
-            if (take > 1e-4) {
-                wsl[nslw] = take; idxw[nslw] = lad[mem[i]];
-                double own = tt * gov[i];
-                wlf[nslw] = own > 1e-9 ? take / own : 0.0;
-                if (wlf[nslw] > 1.0) wlf[nslw] = 1.0;
-                nslw++;
-            }
-            rem -= take;
-        }
-    }
-    if (!nslw) {                             // camera outside everything: nearest
-        double best = 1e18; int bi = lad[0];
-        for (int k = 0; k < n_lad; k++) {
-            struct pack *p = &packs[lad[k]];
-            double ddx = cam_x - (p->mx0 + p->msx * 0.5);
-            double ddy = cam_y - (p->my0 + p->msy * 0.5);
-            if (ddx*ddx + ddy*ddy < best) { best = ddx*ddx + ddy*ddy; bi = lad[k]; }
-        }
-        wsl[0] = 1.0; idxw[0] = bi; wlf[0] = 1.0; nslw = 1;
-    }
     // top-3 by weight -> slots 0-2 (slot0 = dominant). Every rendered
     // weight is (w - 4th weight): as two packs converge on 3rd place the
     // rendered slot fades to zero, so its identity crossover happens AT zero
@@ -2199,35 +2383,22 @@ static void step_world(void) {
     if (w1v < 0.0) w1v = 0.0;
     if (w2v < 0.0) w2v = 0.0;
     // COVERAGE GUARANTEE (slot 3): the finest pack whose bbox holds the
-    // whole view (plus a margin for the sphere's curvature) renders at a
+    // whole view (view_container) renders at a
     // token weight whenever slots 0-2 don't already hold it. The top-3 cut
     // alone could drop the only pack covering part of the screen, which then
     // went bare until the ranks moved on (a strip below sw-montana while two
     // ski sites outweighed yellowstone-region). Where others cover, the
     // token is a ~1% share; where nothing else does, it is the picture.
 #define CONTAIN_EPS 0.01
-    int cont = -1;
-    {
-        // margin ~ the sphere's edge distortion (angular view size squared),
-        // less a hair so an idle view touching its own pack's edge counts
-        double th = cam_h * 2.0 * M_PI, mf = th * th * 0.25 - 1e-3;
-        if (mf > 0.1) mf = 0.1;
-        double mx = mf * (vx1 - vx0), my = mf * (vy1 - vy0);
-        for (int k = 0; k < n_lad && cont < 0; k++) {     // fine -> coarse
-            struct pack *p = &packs[lad[k]];
-            if ((p->msx > 0.999 || (p->mx0 <= vx0 - mx && p->mx0 + p->msx >= vx1 + mx)) &&
-                p->my0 <= vy0 - my && p->my0 + p->msy >= vy1 + my) cont = lad[k];
-        }
-        if (cont < 0) cont = lad[n_lad - 1];             // the coarsest (earth)
-    }
+    int cont = view_container(cam_x, cam_y, cam_h);
     double w3v = 0.0;
     if (cont == a || cont == b || cont == gg || !ensure_pack_gl(cont)) cont = -1;
     else w3v = CONTAIN_EPS;
     if (w0v < 1e-4) w0v = 1e-4;
     if (a < 0) a = p_cur >= 0 ? p_cur : lad[0];
-    ensure_pack_gl(a);                       // backstop; flights preload ahead
-    if (b != a && !ensure_pack_gl(b)) { b = a; w1v = 0.0; }
-    if (gg >= 0 && !ensure_pack_gl(gg)) { gg = -1; w2v = 0.0; }
+    ensure_pack_gl(a);                       // resident unless nothing is
+    if (b != a && !packs[b].gl_ok) { b = a; w1v = 0.0; }
+    if (gg >= 0 && !packs[gg].gl_ok) { gg = -1; w2v = 0.0; }
     s_slotpk[0] = a; s_slotpk[1] = b; s_slotpk[2] = gg; s_slotpk[3] = cont;
     g_w0v = (float)w0v; g_w1v = (float)w1v; g_w2v = (float)w2v; g_w3v = (float)w3v;
     // FEATURE GATES (shader feature layer): a slot's roads/lifts/borders ink
@@ -2286,7 +2457,7 @@ static void step_world(void) {
                     cont >= 0 ? packs[cont].name : "-", w3v);
             for (int k = 0; k < nslw; k++)
                 fprintf(rec_trace, "%s%s:%.4f", k ? "," : "", packs[idxw[k]].name, wsl[k]);
-            fputc('\n', rec_trace);
+            fprintf(rec_trace, " fg=%.3f,%.3f,%.3f,%.3f\n", g_fg[0], g_fg[1], g_fg[2], g_fg[3]);
             fflush(rec_trace);
         }
     }
@@ -3055,12 +3226,13 @@ void engine_step(int w, int h) {
     }
     if (pending_area[0] && !fly_active && cam_init) {
         int tgt = find_pack(pending_area);
-        if (tgt >= 0 && tgt != p_cur && ensure_pack_gl(tgt)) start_flight(tgt);
+        if (tgt >= 0 && tgt != p_cur && pack_stream(tgt, 0) >= 0) start_flight(tgt);
         else if (tgt != p_cur)
             fprintf(stderr, "topopaper: no such area '%s' (yet)\n", pending_area);
         pending_area[0] = '\0';
     }
 
+    stream_tick();
     step_world();
     sun_update();                            // live sun follows the camera
     if (!cfg.labels)                         // labels re-enabled later fade in
