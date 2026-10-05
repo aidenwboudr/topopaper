@@ -37,8 +37,8 @@
 //     the whole view during flights, so no part of the screen is ever bare.
 //     Every slot shades with one shared scale and the roads/lifts/borders
 //     composite as one layer that appears once its scale fills the view, so
-//     overlapping packs hand over without
-//     showing their rectangles. Only packs whose bbox INTERSECTS THE VIEW
+//     overlapping packs hand over without showing their rectangles. Only
+//     packs whose bbox INTERSECTS THE VIEW
 //     are candidates — same-scale SIBLING packs elsewhere on the map (Tetons
 //     vs Wind Rivers) never blend in by height alone, and a cross-country
 //     flight naturally picks up each area it overflies. slot0 is always the
