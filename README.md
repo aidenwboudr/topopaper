@@ -67,7 +67,10 @@ To remove it: `./uninstall.sh` (keeps your maps and settings) or
 | **Everything else** | `topopaper-ctl --help` |
 
 Building a new map takes a few minutes (the data comes from public servers);
-the wallpaper keeps running and flies there when it's ready. Maps you searched
+the wallpaper keeps running and flies there when it's ready. The first map in
+a new part of the world also gets a few coarser in-between maps so it zooms
+smoothly out to the globe — those finish in the background and can take a
+while when the public map servers are busy. Maps you searched
 for are kept until you delete them in Settings → Places, or clean up old ones
 with `topopaper-ctl gc`.
 
