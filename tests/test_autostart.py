@@ -180,3 +180,19 @@ def test_niri_refuses_duplicate_binding(home, monkeypatch):
     cfg.write_text(orig)
     ok, msg = autostart.keybind_add()
     assert not ok and "already bound" in msg and cfg.read_text() == orig
+
+
+def test_own_start_line_counts_as_enabled(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / ".config"))
+    monkeypatch.setenv("TOPOPAPER_COMPOSITOR", "sway")
+    d = tmp_path / ".config" / "sway" / "config.d"
+    d.mkdir(parents=True)
+    (tmp_path / ".config" / "sway" / "config").write_text(f"include {d}/*\n")
+    (d / "autostart.conf").write_text("# exec topopaper-session (commented)\n")
+    assert autostart.status()["enabled"] is False
+    (d / "autostart.conf").write_text("exec_always --no-startup-id ~/.local/bin/topopaper-session\n")
+    st = autostart.status()
+    assert st["enabled"] is True and st["method"] == "own-config"
+    ok, msg = autostart.disable()
+    assert ok is False and "your own line" in msg

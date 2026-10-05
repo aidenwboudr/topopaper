@@ -82,14 +82,17 @@ def run(plan):
     ok = step("building the map", "build", slug, "--bbox", f"{s:.4f}", f"{w:.4f}",
               f"{n:.4f}", f"{e:.4f}", "--zoom", str(plan["zoom"]),
               "--tier", str(plan["tier"]), "--auto")
-    ok = ok and step("connecting it to the globe", "route", slug)
     if not ok:
         _status(slug, state="failed", stage="build failed", display=disp)
         util.notify(f"map build failed — see {log_path(slug)}", 5000)
         return 1
+    # fly as soon as the map exists: the in-between maps that smooth the zoom
+    # out to the globe can take much longer (the first map in a new region
+    # needs continent-scale ones), and the engine picks them up live
     util.fly(slug, quiet=True)
-    util.notify(f"maps ready — flying to {disp}", 3200)
-    _status(slug, state="running", stage="looking for ski areas", display=disp)
+    util.notify(f"map ready — flying to {disp}", 3200)
+    if not step("connecting it to the globe", "route", slug):
+        util.notify(f"couldn't finish the zoom-out maps for {disp} — see {log_path(slug)}", 5000)
     step("looking for ski areas", "site", slug)
     _status(slug, state="done", stage="ready", display=disp)
     return 0
