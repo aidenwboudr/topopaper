@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# topopaper installer.
+# topopaper installer for Linux and macOS (Windows: install.ps1).
 #
 #   ./install.sh                      from a checkout: install for this user (~/.local)
 #   curl -fsSL https://raw.githubusercontent.com/aidenwboudr/topopaper/main/install.sh | bash
@@ -67,10 +67,17 @@ if [ -n "${BASH_SOURCE[0]:-}" ] && [ -f "$(dirname "${BASH_SOURCE[0]}")/Makefile
     SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 fi
 
+MACOS=0
+[ "$(uname -s)" = Darwin ] && MACOS=1
+
 # ---- 1. desktop --------------------------------------------------------------
 say "Checking your desktop"
 desk="${XDG_CURRENT_DESKTOP:-}"
-if [ -n "${SWAYSOCK:-}" ]; then ok "Sway"
+if [ "$MACOS" = 1 ]; then
+    mv="$(sw_vers -productVersion 2>/dev/null || echo 0)"
+    case "$mv" in 10.*) [ "${mv#10.}" -ge 15 ] 2>/dev/null || die "topopaper needs macOS 10.15 or newer (this is $mv)" ;; esac
+    ok "macOS $mv"
+elif [ -n "${SWAYSOCK:-}" ]; then ok "Sway"
 elif [ -n "${HYPRLAND_INSTANCE_SIGNATURE:-}" ]; then ok "Hyprland"
 elif [ -n "${NIRI_SOCKET:-}" ]; then ok "niri"
 elif [[ "$desk" == *KDE* ]]; then ok "KDE Plasma"
@@ -83,8 +90,9 @@ else warn "not running inside a Wayland session right now; installing anyway"; f
 # ---- 2. system packages ------------------------------------------------------
 say "Checking build and runtime dependencies"
 # shellcheck disable=SC1091
-. /etc/os-release 2>/dev/null || true
+[ "$MACOS" = 1 ] || . /etc/os-release 2>/dev/null || true
 family=""
+[ "$MACOS" = 1 ] && family=macos
 for id in ${ID:-} ${ID_LIKE:-}; do
     case "$id" in
         arch|manjaro|endeavouros|cachyos) family=arch; break ;;
@@ -113,6 +121,18 @@ esac
 
 PYBIN=""
 pick_python() {   # a Python that has GObject introspection (for the settings app)
+    if [ "$MACOS" = 1 ]; then   # macOS: 3.9+ with venv, preferring one with Tk
+        local any=""
+        for p in python3 /opt/homebrew/bin/python3 /usr/local/bin/python3 /usr/bin/python3; do
+            command -v "$p" >/dev/null || continue
+            "$p" -c 'import sys, venv; sys.exit(sys.version_info < (3, 9))' 2>/dev/null || continue
+            [ -n "$any" ] || any="$(command -v "$p")"
+            if "$p" -c 'import tkinter; tkinter.Tcl()' 2>/dev/null; then
+                PYBIN="$(command -v "$p")"; return 0; fi
+        done
+        PYBIN="$any"
+        [ -n "$PYBIN" ]; return
+    fi
     for p in /usr/bin/python3 python3; do
         if command -v "$p" >/dev/null && "$p" -c 'import gi' 2>/dev/null; then
             PYBIN="$(command -v "$p")"; return 0; fi
@@ -123,6 +143,12 @@ pick_python() {   # a Python that has GObject introspection (for the settings ap
 
 missing() {
     local m=()
+    if [ "$MACOS" = 1 ]; then
+        xcode-select -p >/dev/null 2>&1 && command -v cc >/dev/null || m+=("Xcode command line tools")
+        pick_python || m+=("Python 3.9+")
+        printf '%s\n' "${m[@]}"
+        return
+    fi
     command -v cc >/dev/null || command -v gcc >/dev/null || m+=("C compiler")
     command -v make >/dev/null || m+=("make")
     command -v pkg-config >/dev/null || command -v pkgconf >/dev/null || m+=("pkg-config")
@@ -145,6 +171,15 @@ EOF
 }
 
 need="$(missing)"
+if [ -n "$need" ] && [ "$MACOS" = 1 ]; then
+    warn "missing: $(echo "$need" | paste -sd, - | sed 's/,/, /g')"
+    if [[ "$need" == *Xcode* ]] && ask "  Install Apple's command line tools now (a system dialog opens)?"; then
+        xcode-select --install 2>/dev/null || true
+        die "finish the command line tools install in the dialog, then run this again"
+    fi
+    [[ "$need" == *Python* ]] && warn "get Python 3 from https://www.python.org/downloads/ or: brew install python python-tk"
+    die "still missing: $(echo "$need" | paste -sd, - | sed 's/,/, /g')"
+fi
 if [ -n "$need" ]; then
     warn "missing: $(echo "$need" | paste -sd, - | sed 's/,/, /g')"
     if [ -n "$family" ] && [ "$DEPS" = 1 ]; then
@@ -165,6 +200,9 @@ if [ -n "$need" ]; then
 fi
 ok "all dependencies present"
 pick_python || true
+if [ "$MACOS" = 1 ] && ! "$PYBIN" -c 'import tkinter; tkinter.Tcl()' 2>/dev/null; then
+    warn "$PYBIN has no Tk: the settings window won't open (brew install python-tk, or Python from python.org)"
+fi
 
 # ---- 3. get the source -----------------------------------------------------------
 if [ -z "$SRC" ]; then
@@ -199,6 +237,12 @@ if [ ! -x "$VENV/bin/python" ]; then
         warn "python venv unavailable; using $PYBIN directly (timezone lookup and fast unpacking will be off)"
     fi
 fi
+if [ "$MACOS" = 1 ]; then          # no distro packages: the builder's needs go in the venv
+    [ -x "$VENV/bin/python" ] || die "couldn't create $VENV with $PYBIN"
+    "$VENV/bin/python" -m pip install -q --disable-pip-version-check numpy pillow \
+        || die "pip could not install numpy and Pillow (offline?)"
+    ok "numpy and Pillow installed"
+fi
 if [ -x "$VENV/bin/python" ]; then
     # optional extras: offline timezones for far-away maps, and zstd unpacking
     if "$VENV/bin/python" -m pip install -q --disable-pip-version-check timezonefinder zstandard 2>/dev/null; then
@@ -210,8 +254,9 @@ fi
 
 case ":$PATH:" in
     *":$BIN:"*) ;;
-    *) warn "$BIN is not on your PATH — add it in your shell profile, e.g.:"
-       echo "      echo 'export PATH=\"$BIN:\$PATH\"' >> ~/.profile" ;;
+    *) profile="$HOME/.profile"; [ "$MACOS" = 1 ] && profile="$HOME/.zprofile"
+       warn "$BIN is not on your PATH — add it in your shell profile, e.g.:"
+       echo "      echo 'export PATH=\"$BIN:\$PATH\"' >> $profile" ;;
 esac
 CTL="$BIN/topopaper-ctl"
 
@@ -226,7 +271,9 @@ if [ "$AUTOSTART" = 1 ]; then
     if ask "Start topopaper automatically when you log in?"; then
         "$CTL" autostart enable || warn "autostart: see the message above"
     fi
-    if ask "Add a Super+Shift+B shortcut to search the map?"; then
+    if [ "$MACOS" = 1 ]; then
+        "$CTL" keybind status | sed 's/^not set: /  tip: /'
+    elif ask "Add a Super+Shift+B shortcut to search the map?"; then
         "$CTL" keybind add || warn "shortcut: see the message above"
     fi
 fi
@@ -234,7 +281,7 @@ fi
 # ---- 8. go -------------------------------------------------------------------
 say "Done"
 "$CTL" doctor --offline || true
-if [ "$LAUNCH" = 1 ] && [ -n "${WAYLAND_DISPLAY:-}" ]; then
+if [ "$LAUNCH" = 1 ] && { [ -n "${WAYLAND_DISPLAY:-}" ] || [ "$MACOS" = 1 ]; }; then
     "$CTL" restart >/dev/null 2>&1 || true
     "$CTL" settings >/dev/null 2>&1 || true
     echo "The wallpaper is starting, and the settings window is opening."
