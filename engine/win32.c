@@ -376,7 +376,7 @@ static int all_covered(void) {
 // buffer), before the swap: the screen then still shows the frame before,
 // which differs by a fraction of a contour's drift.
 static void visibility_check(struct view *v) {
-    enum { G = 12 };
+    enum { G = 32 };
     struct pt { int x, y; } pts[G * G];
     int n = 0;
     RECT w = v->work;
@@ -388,7 +388,7 @@ static void visibility_check(struct view *v) {
             if (root && counts(root)) continue;  // an app window is in the way
             pts[n].x = p.x; pts[n].y = p.y; n++;
         }
-    if (n < 16) {                            // the desktop is mostly covered: later
+    if (n < 24) {                            // the desktop is mostly covered: later
         vis_check_at = ++vis_tries < 30 ? engine_now() + 10.0 : -1.0;
         return;
     }

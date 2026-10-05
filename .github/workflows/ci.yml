@@ -154,6 +154,19 @@ jobs:
           New-Item -ItemType Directory shots\session -Force | Out-Null
           Copy-Item "$env:LOCALAPPDATA\topopaper\state\logs\*.log" shots\session\ -ErrorAction SilentlyContinue
           Get-Content shots\session\session.log, shots\session\engine.log -ErrorAction SilentlyContinue
+      - name: Settings window (Tk)
+        shell: pwsh
+        run: |
+          $py = "$env:LOCALAPPDATA\topopaper\venv\Scripts\python.exe"
+          & $py -c "import sys, tkinter; print(sys.version); print('Tk', tkinter.Tcl().eval('info patchlevel'))"
+          & "$env:LOCALAPPDATA\Programs\topopaper\bin\topopaper-settings.cmd"
+          Start-Sleep 12
+          Add-Type -AssemblyName System.Windows.Forms, System.Drawing
+          $b = [System.Windows.Forms.SystemInformation]::VirtualScreen
+          $bmp = New-Object System.Drawing.Bitmap $b.Width, $b.Height
+          [System.Drawing.Graphics]::FromImage($bmp).CopyFromScreen($b.Left, $b.Top, 0, 0, $bmp.Size)
+          $bmp.Save("$pwd\shots\settings.png")
+          Get-Process pythonw -ErrorAction SilentlyContinue | Stop-Process -Force
       - name: uninstall.ps1
         shell: powershell
         run: |
@@ -180,6 +193,16 @@ jobs:
         run: |
           ./install.sh --yes --no-launch
           test -x ~/Applications/Topopaper.app/Contents/MacOS/Topopaper
+      - name: Settings window (Tk)
+        run: |
+          mkdir -p shots
+          py=~/.local/share/topopaper/venv/bin/python
+          $py -c "import sys, tkinter; print(sys.version); print('Tk', tkinter.Tcl().eval('info patchlevel'))"
+          ~/.local/bin/topopaper-settings > shots/settings.log 2>&1 &
+          sleep 12
+          screencapture -x shots/settings.png || true
+          kill %1 2>/dev/null || true
+          cat shots/settings.log
       - name: Unit tests
         run: |
           ~/.local/share/topopaper/venv/bin/python -m pip install -q pytest
