@@ -101,7 +101,7 @@ struct pack {
     float  elev_lo, elev_hi, step;
     float  focus_u, focus_v;
     float  stL[6], stA[6];          // r,g,b, w0px,w1px, opacity
-    GLuint ter_tex, feat_tex, atlas_tex, water_tex;
+    GLuint ter_tex, fw_tex, atlas_tex;   // fw: features rg + water b
     int    ter_w, ter_h, atlas_w, atlas_h;
     int    n_lab;
     float  lab_u[PKMAX], lab_v[PKMAX], lab_hmin[PKMAX], lab_hmax[PKMAX];
@@ -117,19 +117,19 @@ static int lad[MAXPACKS];           // pack indices sorted by msy ASC (fine->coa
 static int n_lad = 0;
 static int p_cur = -1;              // home pack: idle camera + roam source
 static int s_slotpk[3] = {-1, -1, -1};  // shader slots: 0/1 full, 2 = guarantor
-static float g_lf0 = 1.0f, g_lf1 = 1.0f; // label factors: territory share (sibling law)
-static double sv_cx[2], sv_cy[2], sv_hx[2], sv_hy[2];   // slot view transforms
-static const int UNIT_TER[2]  = {0, 3};
-static const int UNIT_FEAT[2] = {2, 4};
-static const int UNIT_WAT[2]  = {5, 6};
-static const int UNIT_TER2    = 7;      // guarantor slot: terrain-only
-static GLuint ph_ter_tex = 0, ph_feat_tex = 0, ph_wat_tex = 0;   // 1x1 placeholders
+static float g_lf[3] = {1.0f, 1.0f, 1.0f}; // label factors: territory share (sibling law)
+static double sv_cx[3], sv_cy[3], sv_hx[3], sv_hy[3];   // slot view transforms
+// three full slots in six units (GLES2 guarantees eight; the label atlas
+// takes unit 1 in its own pass)
+static const int UNIT_TER[3] = {0, 3, 6};
+static const int UNIT_FW[3]  = {2, 4, 5};
+static GLuint ph_ter_tex = 0, ph_fw_tex = 0;    // 1x1 placeholders
 
 // ---- GL program ------------------------------------------------------------
 static GLuint prog, vbo;
 static GLint a_pos;
 static GLint u_res, u_crawlm, u_cpu, u_night, u_w;
-static GLint u_texel2, u_tc2, u_ts2, u_ctr2, u_fam;
+static GLint u_fam;
 static GLint u_dbg = -1;
 static GLint u_radpx, u_globec, u_wrap, u_sun, u_sunh, u_snow, u_aur;
 // city lights (lights.bin: world cities for the globe's night side)
@@ -138,8 +138,8 @@ static float  lt_lat[MAXLTS], lt_lon[MAXLTS], lt_w[MAXLTS];
 static int    g_lts_n = 0;
 static GLuint ltprog = 0;
 static GLint  lta_pos = -1, ltu_pts = -1;
-static GLint u_texel[2], u_tc[2], u_ts[2], u_ctr[2];
-static GLint u_fcl[2], u_fpl[2], u_fca[2], u_fpa[2];
+static GLint u_texel[3], u_tc[3], u_ts[3], u_ctr[3];
+static GLint u_fcl[3], u_fpl[3], u_fca[3], u_fpa[3];
 static GLuint lprog;
 static GLint la_pos, lu_rect, lu_uv, lu_alpha;
 // theme palette uniforms (main, label and city-light programs)
@@ -630,16 +630,16 @@ static void upload_la(GLuint tex, int unit, int w, int h,
                  GL_LUMINANCE_ALPHA, GL_UNSIGNED_BYTE, data);
 }
 
-static void upload_l(GLuint tex, int unit, int w, int h,
-                     const unsigned char *data) {
+static void upload_rgb(GLuint tex, int unit, int w, int h,
+                       const unsigned char *data) {
     glActiveTexture(GL_TEXTURE0 + unit);
     glBindTexture(GL_TEXTURE_2D, tex);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_LUMINANCE, w, h, 0,
-                 GL_LUMINANCE, GL_UNSIGNED_BYTE, data);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, w, h, 0,
+                 GL_RGB, GL_UNSIGNED_BYTE, data);
 }
 
 static void load_hud(void) {
@@ -870,37 +870,42 @@ static int ensure_pack_gl(int idx) {
     free(ter);
     p->ter_w = (int)tw; p->ter_h = (int)th;
 
-    glGenTextures(1, &p->feat_tex);
+    // features (roads/runs L, lifts/borders A) and water (signed shore
+    // distance) share one RGB texture, so all three slots fit the GLES2
+    // texture-unit budget. Builders write both at the terrain's size; a
+    // pack whose sizes differ gets its water resampled onto the features.
     snprintf(path, sizeof path, "%s/%s/features.bin", areas_dir, p->name);
-    unsigned int fw, fh;
+    unsigned int fw = 1, fh = 1, ww = 0, wh = 0;
     unsigned char *feat = read_bin(path, "TOPORDS1", &fw, &fh);
-    if (feat) {
-        upload_la(p->feat_tex, UNIT_FEAT[0], fw, fh, feat, GL_LINEAR);
-        free(feat);
-    } else {
-        unsigned char far2[2] = {255, 255};
-        upload_la(p->feat_tex, UNIT_FEAT[0], 1, 1, far2, GL_LINEAR);
-        p->stL[5] = p->stA[5] = 0.0f;
-    }
-
-    // water.bin: optional signed shore-distance (128 = shoreline, <128 water)
+    if (!feat) { fw = fh = 1; p->stL[5] = p->stA[5] = 0.0f; }
+    unsigned char *wb = NULL;
     snprintf(path, sizeof path, "%s/%s/water.bin", areas_dir, p->name);
     FILE *wf = fopen(path, "rb");
     if (wf) {
-        char wm[8]; unsigned int ww, wh;
+        char wm[8];
         if (fread(wm, 1, 8, wf) == 8 && !memcmp(wm, "TOPOWTR1", 8) &&
             fread(&ww, 4, 1, wf) == 1 && fread(&wh, 4, 1, wf) == 1 &&
             ww > 0 && wh > 0 && ww <= 8192 && wh <= 8192) {
             size_t nb = (size_t)ww * wh;
-            unsigned char *wb = malloc(nb);
-            if (wb && fread(wb, 1, nb, wf) == nb) {
-                glGenTextures(1, &p->water_tex);
-                upload_l(p->water_tex, UNIT_WAT[0], (int)ww, (int)wh, wb);
-            }
-            free(wb);
+            wb = malloc(nb);
+            if (wb && fread(wb, 1, nb, wf) != nb) { free(wb); wb = NULL; }
         }
         fclose(wf);
     }
+    if (!feat && wb) { fw = ww; fh = wh; }   // water only: its own size
+    unsigned char *fwb = malloc((size_t)fw * fh * 3);
+    if (fwb) {
+        for (unsigned int y = 0; y < fh; y++)
+            for (unsigned int x = 0; x < fw; x++) {
+                size_t o = (size_t)y * fw + x;
+                fwb[o * 3 + 0] = feat ? feat[o * 2 + 0] : 255;
+                fwb[o * 3 + 1] = feat ? feat[o * 2 + 1] : 255;
+                fwb[o * 3 + 2] = wb ? wb[(size_t)(y * wh / fh) * ww + x * ww / fw] : 255;
+            }
+        glGenTextures(1, &p->fw_tex);
+        upload_rgb(p->fw_tex, UNIT_FW[0], (int)fw, (int)fh, fwb);
+    }
+    free(fwb); free(feat); free(wb);
 
     p->n_lab = 0;
     snprintf(path, sizeof path, "%s/%s/labels.bin", areas_dir, p->name);
@@ -952,8 +957,8 @@ static int ensure_pack_gl(int idx) {
         // full-world pack: wrap horizontally so bicubic taps cross the date
         // line instead of clamping into a seam column at 180° (visible now
         // that Pacific departures centre the seam on screen)
-        GLuint ts[3] = { p->ter_tex, p->feat_tex, p->water_tex };
-        for (int i = 0; i < 3; i++) if (ts[i]) {
+        GLuint ts[2] = { p->ter_tex, p->fw_tex };
+        for (int i = 0; i < 2; i++) if (ts[i]) {
             glBindTexture(GL_TEXTURE_2D, ts[i]);
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
         }
@@ -968,9 +973,9 @@ static int ensure_pack_gl(int idx) {
 static void pack_gl_free(int idx) {
     struct pack *p = &packs[idx];
     if (!p->gl_ok) return;
-    GLuint t[4] = { p->ter_tex, p->feat_tex, p->atlas_tex, p->water_tex };
-    for (int i = 0; i < 4; i++) if (t[i]) glDeleteTextures(1, &t[i]);
-    p->ter_tex = p->feat_tex = p->atlas_tex = p->water_tex = 0;
+    GLuint t[3] = { p->ter_tex, p->fw_tex, p->atlas_tex };
+    for (int i = 0; i < 3; i++) if (t[i]) glDeleteTextures(1, &t[i]);
+    p->ter_tex = p->fw_tex = p->atlas_tex = 0;
     p->n_lab = 0;
     memset(p->lab_vis, 0, sizeof p->lab_vis);
     p->gl_ok = 0;
@@ -1330,13 +1335,14 @@ static const char *FRAG =
     "uniform vec3 uRimC, uIceC, uAurA, uAurB;\n"
     "uniform vec3 uWrap;\n"                  // per-slot: 1 = full-world pack, wrap u
     "uniform float uDbg;\n"                  // TOPA_REC_DBG: 1 slot shares, 2-4 slot 0-2 alone
-    "uniform sampler2D uTer0, uFeat0, uTer1, uFeat1, uWat0, uWat1, uTer2;\n"
+    "uniform sampler2D uTer0, uFW0, uTer1, uFW1, uTer2, uFW2;\n"
     "uniform vec2 uTexel0, uTC0, uTS0;\n"
     "uniform vec2 uTexel1, uTC1, uTS1;\n"
     "uniform vec2 uTexel2, uTC2, uTS2;\n"
     "uniform vec4 uCtr0, uCtr1, uCtr2;\n"   // x levScale, y levOff, z 1/step, w px-per-texel
     "uniform vec3 uFcL0, uFpL0, uFcA0, uFpA0;\n"  // colour rgb | w0,w1,opacity
     "uniform vec3 uFcL1, uFpL1, uFcA1, uFpA1;\n"
+    "uniform vec3 uFcL2, uFpL2, uFcA2, uFpA2;\n"
     // ---- 16-bit heightmap sampling (hi in .r, lo in .a) --------------------
     "float terS(sampler2D t, vec2 uv){ vec4 s=texture2D(t,uv); return s.r*0.9961090+s.a*0.0038911; }\n"
     // plain bilinear — used only for the hillshade gradient (broad soft signal)
@@ -1345,7 +1351,7 @@ static const char *FRAG =
     "  vec2 b=(i+0.5)*texel;\n"
     "  return mix(mix(terS(t,b),terS(t,b+vec2(texel.x,0.)),f.x),\n"
     "             mix(terS(t,b+vec2(0.,texel.y)),terS(t,b+texel),f.x),f.y); }\n"
-    // plain B-spline bicubic on a single .r channel — used for the water
+    // plain B-spline bicubic on the water (.b) channel — used for the water
     // SDF when a coarse pack rides far above its native scale (bilinear
     // texel diamonds read as staircase coasts under ~10x magnification)
     "float watBic(sampler2D t, vec2 texel, vec2 uv){\n"
@@ -1361,7 +1367,7 @@ static const char *FRAG =
     "    float rv=0.0;\n"
     "    for(int i=-1;i<=2;i++){\n"
     "      float w=(i==-1)?wx.x:((i==0)?wx.y:((i==1)?wx.z:wx.w));\n"
-    "      rv+=w*texture2D(t,b+vec2(float(i),float(j))*texel).r;\n"
+    "      rv+=w*texture2D(t,b+vec2(float(i),float(j))*texel).b;\n"
     "    }\n"
     "    float wj=(j==-1)?wy.x:((j==0)?wy.y:((j==1)?wy.z:wy.w));\n"
     "    s+=wj*rv;\n"
@@ -1414,7 +1420,7 @@ static const char *FRAG =
     "  float l=1.0-smoothstep(w, w+g, d);\n"
     "  return l*(1.0-smoothstep(0.18, 0.42, g)); }\n"
     // ---- full real-terrain colour for one slot (uv-space core) -------------
-    "vec3 slotRealUV(vec2 uv, sampler2D ter, sampler2D feat, sampler2D wat,\n"
+    "vec3 slotRealUV(vec2 uv, sampler2D ter, sampler2D fw,\n"
     "                vec2 texel, vec4 ctr,\n"
     "                vec3 fcL, vec3 fpL, vec3 fcA, vec3 fpA){\n"
     "  float h=terBic(ter, texel, uv);\n"
@@ -1436,7 +1442,7 @@ static const char *FRAG =
     "  float major=max(lM*(1.0-uFam.y), lS);\n"
     // water: signed shore distance (0.502 = shoreline, below = water).
     // contours/index lines stop at the shore; fill + crisp shoreline below.
-    "  float wd=(ctr.w>3.0)?watBic(wat, texel, uv):texture2D(wat, uv).r;\n"
+    "  float wd=(ctr.w>3.0)?watBic(fw, texel, uv):texture2D(fw, uv).b;\n"
     "  float land=smoothstep(0.494, 0.514, wd);\n"
     "  minor*=land; major*=land;\n"
     "  vec2 suvy=gl_FragCoord.xy/uRes.xy;\n"
@@ -1462,7 +1468,7 @@ static const char *FRAG =
     // crawl removed); roads/labels draw after, so passes stay plowed
     "  float sn=smoothstep(uSnow, uSnow+140.0, hm-uCrawlM)*land;\n"
     "  col=mix(col, uSnowC, sn*0.42);\n"
-    "  vec2 rdt=texture2D(feat, uv).ra;\n"
+    "  vec2 rdt=texture2D(fw, uv).rg;\n"
     "  float dL=rdt.x*31.875*ctr.w;\n"
     "  float dA=rdt.y*31.875*ctr.w;\n"
     "  float sL=1.0-smoothstep(fpL.x, fpL.y, dL);\n"
@@ -1471,40 +1477,6 @@ static const char *FRAG =
     "  col=mix(col, fcA, sA*fpA.z);\n"
     "  float line=max(minor, major);\n"
     "  col=mix(col, uWarmC, line*uCpu*0.28);\n"
-    "  return col; }\n"
-    // GUARANTOR (slot 2): terrain-only backfill for view overhangs — the
-    // coverage deficit of slots 0/1 lands here. Contours + hillshade from
-    // ter2; water derived from raw elevation (<=0 m: bathymetry carries the
-    // oceans, lakes are absent — acceptable for brief edge backfill).
-    "vec3 slotG(vec2 uv){\n"
-    "  float hh=terBic(uTer2, uTexel2, uv);\n"
-    "  float hm=uCtr2.x+hh*uCtr2.y+uCrawlM;\n"
-    "  float lF=lineAt(hm, uFam.x);\n"
-    "  float lM=lineAt(hm, uFam.x*5.0);\n"
-    "  float lS=lineAt(hm, uFam.x*25.0);\n"
-    "  float minor=max(lF*(1.0-uFam.y), lM*uFam.y);\n"
-    "  float major=max(lM*(1.0-uFam.y), lS);\n"
-    "  float em=uCtr2.x+hh*uCtr2.y;\n"
-    "  float land=smoothstep(0.0, 6.0, em);\n"
-    "  minor*=land; major*=land;\n"
-    "  vec2 suvy=gl_FragCoord.xy/uRes.xy;\n"
-    "  vec3 base=mix(uBgLo, uBgHi, suvy.y);\n"
-    "  vec2 gx=vec2(uTexel2.x*2.4, 0.0);\n"
-    "  vec2 gy=vec2(0.0, uTexel2.y*2.4);\n"
-    "  vec2 g2=vec2(terBil(uTer2,uTexel2,uv+gx)-terBil(uTer2,uTexel2,uv-gx),\n"
-    "               terBil(uTer2,uTexel2,uv+gy)-terBil(uTer2,uTexel2,uv-gy));\n"
-    "  vec3 nrm=normalize(vec3(-g2.x*80.0, -g2.y*80.0, 1.0));\n"
-    "  float sh=clamp(dot(nrm, normalize(uSunH.xyz)), 0.0, 1.0);\n"
-    "  base*=mix(1.0, 0.64+0.68*sh, 0.50);\n"
-    "  base=mix(base, base*vec3(1.26,1.02,0.84), uSunH.w*sh*0.50);\n"
-    "  vec3 lc=mix(uLnLo, uLnHi, clamp(hh*0.85,0.0,1.0));\n"
-    "  vec3 col=mix(base, lc, minor*0.45*0.75);\n"
-    "  col=mix(col, lc*1.22, major*0.60*0.75);\n"
-    "  vec3 wcol=mix(base, uWatC, 0.62);\n"
-    "  col=mix(wcol, col, land);\n"
-    "  float sn=smoothstep(uSnow, uSnow+140.0, em)*land;\n"
-    "  col=mix(col, uSnowC, sn*0.42);\n"
-    "  col=mix(col, uWarmC, max(minor,major)*uCpu*0.28);\n"
     "  return col; }\n"
     "void main(){\n"
     "  vec2 suv=gl_FragCoord.xy/uRes.xy;\n"
@@ -1544,7 +1516,7 @@ static const char *FRAG =
     "    if(uWrap.x>0.5) cl0.x=uv0.x;\n"
     "    vec2 cvv0=uv0; if(uWrap.x>0.5) cvv0.x=0.5;\n"
     "    float cov0=slotCov(cvv0, uTexel0);\n"
-    "    vec3 c0=slotRealUV(cl0, uTer0, uFeat0, uWat0, uTexel0, uCtr0,\n"
+    "    vec3 c0=slotRealUV(cl0, uTer0, uFW0, uTexel0, uCtr0,\n"
     "                       uFcL0, uFpL0, uFcA0, uFpA0);\n"
     "    float w0v=uW.x*cov0;\n"
     "    float w1v=0.0; vec3 c1=vec3(0.0);\n"
@@ -1554,7 +1526,7 @@ static const char *FRAG =
     "      if(uWrap.y>0.5) cl1.x=uv1.x;\n"
     "      vec2 cvv1=uv1; if(uWrap.y>0.5) cvv1.x=0.5;\n"
     "      float cov1=slotCov(cvv1, uTexel1);\n"
-    "      c1=slotRealUV(cl1, uTer1, uFeat1, uWat1, uTexel1, uCtr1,\n"
+    "      c1=slotRealUV(cl1, uTer1, uFW1, uTexel1, uCtr1,\n"
     "                    uFcL1, uFpL1, uFcA1, uFpA1);\n"
     "      w1v=uW.y*cov1;\n"
     "    }\n"
@@ -1565,14 +1537,14 @@ static const char *FRAG =
     "      if(uWrap.z>0.5) cl2.x=uv2.x;\n"
     "      vec2 cvv2=uv2; if(uWrap.z>0.5) cvv2.x=0.5;\n"
     "      float cov2=slotCov(cvv2, uTexel2);\n"
-    "      c2=slotG(cl2);\n"
+    "      c2=slotRealUV(cl2, uTer2, uFW2, uTexel2, uCtr2,\n"
+    "                    uFcL2, uFpL2, uFcA2, uFpA2);\n"
     "      w2v=uW.z*cov2;\n"
     "    }\n"
     "    float tot=w0v+w1v+w2v;\n"
     "    if(uDbg>0.5){\n"
     "      gl_FragColor=vec4(uDbg<1.5?vec3(w0v,w1v,w2v)/max(tot,1e-4)\n"
-    "                        :uDbg<2.5?c0:uDbg<3.5?c1:c2, 1.0);
-"
+    "                        :uDbg<2.5?c0:uDbg<3.5?c1:c2, 1.0);\n"
     "      return; }\n"
     "    vec3 terr=(tot>1e-4)?(c0*w0v+c1*w1v+c2*w2v)/tot:bg;\n"
     "    terr*=0.72+0.28*z;\n"          // limb darkening; ==1.0 up close
@@ -1723,10 +1695,6 @@ void engine_gl_init(void) {
     u_cpu     = glGetUniformLocation(prog, "uCpu");
     u_night   = glGetUniformLocation(prog, "uNight");
     u_w       = glGetUniformLocation(prog, "uW");
-    u_texel2  = glGetUniformLocation(prog, "uTexel2");
-    u_tc2     = glGetUniformLocation(prog, "uTC2");
-    u_ts2     = glGetUniformLocation(prog, "uTS2");
-    u_ctr2    = glGetUniformLocation(prog, "uCtr2");
     u_fam     = glGetUniformLocation(prog, "uFam");
     u_radpx   = glGetUniformLocation(prog, "uRadPx");
     u_dbg     = glGetUniformLocation(prog, "uDbg");
@@ -1739,10 +1707,11 @@ void engine_gl_init(void) {
     static const char *thn[12] = { "uBgLo", "uBgHi", "uLnLo", "uLnHi", "uWatC",
         "uShoreC", "uSnowC", "uWarmC", "uRimC", "uIceC", "uAurA", "uAurB" };
     for (int i = 0; i < 12; i++) u_th[i] = glGetUniformLocation(prog, thn[i]);
-    const char *names[2][8] = {
+    const char *names[3][8] = {
         {"uTexel0","uTC0","uTS0","uCtr0","uFcL0","uFpL0","uFcA0","uFpA0"},
-        {"uTexel1","uTC1","uTS1","uCtr1","uFcL1","uFpL1","uFcA1","uFpA1"}};
-    for (int i = 0; i < 2; i++) {
+        {"uTexel1","uTC1","uTS1","uCtr1","uFcL1","uFpL1","uFcA1","uFpA1"},
+        {"uTexel2","uTC2","uTS2","uCtr2","uFcL2","uFpL2","uFcA2","uFpA2"}};
+    for (int i = 0; i < 3; i++) {
         u_texel[i] = glGetUniformLocation(prog, names[i][0]);
         u_tc[i]    = glGetUniformLocation(prog, names[i][1]);
         u_ts[i]    = glGetUniformLocation(prog, names[i][2]);
@@ -1757,27 +1726,21 @@ void engine_gl_init(void) {
     glBufferData(GL_ARRAY_BUFFER, sizeof(quad), quad, GL_STATIC_DRAW);
 
     glUseProgram(prog);
-    glUniform1i(glGetUniformLocation(prog, "uTer0"),  UNIT_TER[0]);
-    glUniform1i(glGetUniformLocation(prog, "uFeat0"), UNIT_FEAT[0]);
-    glUniform1i(glGetUniformLocation(prog, "uTer1"),  UNIT_TER[1]);
-    glUniform1i(glGetUniformLocation(prog, "uFeat1"), UNIT_FEAT[1]);
-    glUniform1i(glGetUniformLocation(prog, "uWat0"),  UNIT_WAT[0]);
-    glUniform1i(glGetUniformLocation(prog, "uWat1"),  UNIT_WAT[1]);
-    glUniform1i(glGetUniformLocation(prog, "uTer2"),  UNIT_TER2);
-    unsigned char flat[2] = {0, 0}, far2[2] = {255, 255}, dry[1] = {255};
+    static const char *smp[3][2] = {{"uTer0","uFW0"},{"uTer1","uFW1"},{"uTer2","uFW2"}};
+    for (int i = 0; i < 3; i++) {
+        glUniform1i(glGetUniformLocation(prog, smp[i][0]), UNIT_TER[i]);
+        glUniform1i(glGetUniformLocation(prog, smp[i][1]), UNIT_FW[i]);
+    }
+    unsigned char flat[2] = {0, 0}, dryfar[3] = {255, 255, 255};
     glGenTextures(1, &ph_ter_tex);
-    glGenTextures(1, &ph_feat_tex);
-    glGenTextures(1, &ph_wat_tex);
+    glGenTextures(1, &ph_fw_tex);
     upload_la(ph_ter_tex, UNIT_TER[0], 1, 1, flat, GL_NEAREST);
-    upload_la(ph_feat_tex, UNIT_FEAT[0], 1, 1, far2, GL_LINEAR);
-    upload_l(ph_wat_tex, UNIT_WAT[0], 1, 1, dry);
-    for (int i = 0; i < 2; i++) {           // all units start on placeholders
+    upload_rgb(ph_fw_tex, UNIT_FW[0], 1, 1, dryfar);
+    for (int i = 0; i < 3; i++) {
         glActiveTexture(GL_TEXTURE0 + UNIT_TER[i]);
         glBindTexture(GL_TEXTURE_2D, ph_ter_tex);
-        glActiveTexture(GL_TEXTURE0 + UNIT_FEAT[i]);
-        glBindTexture(GL_TEXTURE_2D, ph_feat_tex);
-        glActiveTexture(GL_TEXTURE0 + UNIT_WAT[i]);
-        glBindTexture(GL_TEXTURE_2D, ph_wat_tex);
+        glActiveTexture(GL_TEXTURE0 + UNIT_FW[i]);
+        glBindTexture(GL_TEXTURE_2D, ph_fw_tex);
     }
     glActiveTexture(GL_TEXTURE0);
 
@@ -2140,38 +2103,80 @@ static void step_world(void) {
         }
         wsl[0] = 1.0; idxw[0] = bi; wlf[0] = 1.0; nslw = 1;
     }
-    // top-3 by weight -> slots (slot0 = dominant; slot2 = guarantor tail).
-    // slot2 renders (w3rd - w4th): as two packs converge on 3rd place the
-    // rendered guarantor fades to zero, so its identity crossover happens
-    // AT zero weight — the truncation edge stays continuous too.
+    // COVERAGE GUARANTEE: the finest pack whose bbox holds the whole view
+    // (plus a margin for the sphere's curvature) always renders. With more
+    // than three packs in view, a plain top-3 cut could drop the only pack
+    // covering part of the screen: that part went bare until the ranks moved
+    // on (a strip below sw-montana while two ski sites outweighed
+    // yellowstone-region). The container ranks at least third (ties go to
+    // it) and never renders below CONTAIN_EPS, so the screen it alone covers
+    // always draws; where others cover too, that floor is a ~1% share.
+#define CONTAIN_EPS 0.01
+    int cont = -1;
+    {
+        // margin ~ the sphere's edge distortion (angular view size squared),
+        // less a hair so an idle view touching its own pack's edge counts
+        double th = cam_h * 2.0 * M_PI, mf = th * th * 0.25 - 1e-3;
+        if (mf > 0.1) mf = 0.1;
+        double mx = mf * (vx1 - vx0), my = mf * (vy1 - vy0);
+        for (int k = 0; k < n_lad && cont < 0; k++) {     // fine -> coarse
+            struct pack *p = &packs[lad[k]];
+            if ((p->msx > 0.999 || (p->mx0 <= vx0 - mx && p->mx0 + p->msx >= vx1 + mx)) &&
+                p->my0 <= vy0 - my && p->my0 + p->msy >= vy1 + my) cont = lad[k];
+        }
+        if (cont < 0) cont = lad[n_lad - 1];             // the coarsest (earth)
+    }
+    int ci = -1;
+    for (int k = 0; k < nslw; k++) if (idxw[k] == cont) ci = k;
+    if (ci < 0 && nslw < MAXPACKS) {         // finer packs took all the weight
+        ci = nslw++; wsl[ci] = 0.0; idxw[ci] = cont; wlf[ci] = 0.0;
+    }
+    // rank key: own weight, the container lifted to the 3rd-best other
+    double key[MAXPACKS];
+    {
+        double o1 = 0.0, o2 = 0.0, o3 = 0.0;
+        for (int k = 0; k < nslw; k++) {
+            if (k == ci) continue;
+            double v = wsl[k];
+            if (v > o1) { o3 = o2; o2 = o1; o1 = v; }
+            else if (v > o2) { o3 = o2; o2 = v; }
+            else if (v > o3) o3 = v;
+        }
+        for (int k = 0; k < nslw; k++)
+            key[k] = (k == ci && wsl[k] < o3) ? o3 : wsl[k];
+    }
+    // top-3 by key -> slots (slot0 = dominant). Every rendered weight is
+    // (key - 4th key): as two packs converge on 3rd place the rendered slot
+    // fades to zero, so its identity crossover happens AT zero weight and
+    // pop-ins start at exactly 0; per-pixel normalization rescales, idle
+    // (no 4th) is untouched
     int ord[4] = {-1, -1, -1, -1};
     for (int k = 0; k < nslw; k++)
         for (int j = 0; j < 4; j++)
-            if (ord[j] < 0 || wsl[k] > wsl[ord[j]]) {
+            if (ord[j] < 0 || key[k] > key[ord[j]] ||
+                (key[k] == key[ord[j]] && k == ci)) {
                 for (int m = 3; m > j; m--) ord[m] = ord[m - 1];
                 ord[j] = k; break;
             }
     int a  = ord[0] >= 0 ? idxw[ord[0]] : -1;
     int b  = ord[1] >= 0 ? idxw[ord[1]] : a;
     int gg = ord[2] >= 0 ? idxw[ord[2]] : -1;
-    double w4  = ord[3] >= 0 ? wsl[ord[3]] : 0.0;
-    // subtract the 4th weight from ALL rendered slots: every rank crossing
-    // then happens at equal rendered weights and pop-ins start at exactly 0;
-    // per-pixel normalization rescales, idle (w4=0) is untouched
-    double w0v = ord[0] >= 0 ? wsl[ord[0]] - w4 : 1.0;
-    double w1v = ord[1] >= 0 ? wsl[ord[1]] - w4 : 0.0;
-    double w2v = ord[2] >= 0 ? wsl[ord[2]] - w4 : 0.0;
+    double w4  = ord[3] >= 0 ? key[ord[3]] : 0.0;
+    double wv[3];
+    for (int j = 0; j < 3; j++) {
+        wv[j] = ord[j] >= 0 ? key[ord[j]] - w4 : 0.0;
+        if (wv[j] < 0.0) wv[j] = 0.0;
+        if (ord[j] >= 0 && ord[j] == ci && wv[j] < CONTAIN_EPS) wv[j] = CONTAIN_EPS;
+    }
+    double w0v = ord[0] >= 0 ? wv[0] : 1.0, w1v = wv[1], w2v = wv[2];
     if (w0v < 1e-4) w0v = 1e-4;
-    if (w1v < 0.0) w1v = 0.0;
-    if (w2v < 0.0) w2v = 0.0;
     if (a < 0) a = p_cur >= 0 ? p_cur : lad[0];
     ensure_pack_gl(a);                       // backstop; flights preload ahead
     if (b != a && !ensure_pack_gl(b)) { b = a; w1v = 0.0; }
     if (gg >= 0 && !ensure_pack_gl(gg)) { gg = -1; w2v = 0.0; }
     s_slotpk[0] = a; s_slotpk[1] = b; s_slotpk[2] = gg;
     g_w0v = (float)w0v; g_w1v = (float)w1v; g_w2v = (float)w2v;
-    g_lf0 = ord[0] >= 0 ? (float)wlf[ord[0]] : 1.0f;
-    g_lf1 = ord[1] >= 0 ? (float)wlf[ord[1]] : 1.0f;
+    for (int j = 0; j < 3; j++) g_lf[j] = ord[j] >= 0 ? (float)wlf[ord[j]] : 1.0f;
     {   // TOPA_DEBUG=1: per-frame camera/slot trace for jump hunting
         static int dbg = -1;
         if (dbg < 0) dbg = getenv("TOPA_DEBUG") != NULL;
@@ -2424,10 +2429,8 @@ static void set_slot_uniforms(int i) {
     int okp = s && s->gl_ok;
     glActiveTexture(GL_TEXTURE0 + UNIT_TER[i]);
     glBindTexture(GL_TEXTURE_2D, okp ? s->ter_tex : ph_ter_tex);
-    glActiveTexture(GL_TEXTURE0 + UNIT_FEAT[i]);
-    glBindTexture(GL_TEXTURE_2D, okp ? s->feat_tex : ph_feat_tex);
-    glActiveTexture(GL_TEXTURE0 + UNIT_WAT[i]);
-    glBindTexture(GL_TEXTURE_2D, (okp && s->water_tex) ? s->water_tex : ph_wat_tex);
+    glActiveTexture(GL_TEXTURE0 + UNIT_FW[i]);
+    glBindTexture(GL_TEXTURE_2D, (okp && s->fw_tex) ? s->fw_tex : ph_fw_tex);
     glActiveTexture(GL_TEXTURE0);
     double hx = cam_h * g_ar * 0.5, hy = cam_h * 0.5;
     double cx = okp ? (cam_x - s->mx0) / s->msx : 0.5;
@@ -2468,7 +2471,7 @@ static void set_slot_uniforms(int i) {
 // included — baked collisions and limb foreshortening both resolve); the
 // keep/drop verdict is EASED per label (~0.22s) so arbitration flips
 // crossfade instead of popping.
-#define MAXCAND (2 * PKMAX)
+#define MAXCAND (3 * PKMAX)
 struct labc { int slot, k, keep;
               float x0, y0, x1, y1, a, pri, ox, oy, qw, qh; };
 static struct labc g_lc[MAXCAND];
@@ -2539,13 +2542,23 @@ static void collect_labels(int i, float wabs, int w, int h) {
     }
 }
 
+// slot i holds a pack no earlier slot holds (each pack inks once)
+static int slot_first(int i) {
+    if (s_slotpk[i] < 0) return 0;
+    for (int j = 0; j < i; j++) if (s_slotpk[j] == s_slotpk[i]) return 0;
+    return 1;
+}
+
 // `ease`: only the primary output advances the per-label gates — they are
 // per-pack state, and every output easing them would speed the fades up N x
 static void labels_frame(int w, int h, int ease) {
     g_lcn = 0;
     hud_layout(w, h);
-    collect_labels(0, g_w0v * g_lf0, w, h);
-    if (s_slotpk[1] != s_slotpk[0]) collect_labels(1, g_w1v * g_lf1, w, h);
+    // every slot inks (the coverage container can sit in slot 2 with real
+    // weight); a pack doubled into two slots is drawn once
+    float wsl3[3] = { g_w0v, g_w1v, g_w2v };
+    for (int i = 0; i < 3; i++)
+        if (slot_first(i)) collect_labels(i, wsl3[i] * g_lf[i], w, h);
     for (int a = 1; a < g_lcn; a++) {                // insertion sort by pri
         struct labc t = g_lc[a]; int b = a - 1;
         while (b >= 0 && g_lc[b].pri < t.pri) { g_lc[b+1] = g_lc[b]; b--; }
@@ -2567,19 +2580,24 @@ static void labels_frame(int w, int h, int ease) {
     }
     // ease every label's gate toward its verdict (uncollected labels -> 0)
     float ke = ease ? 1.0f - expf((float)(-g_mdt / 0.22)) : 0.0f;
-    unsigned char tgt[2][PKMAX] = {{0}};
+    unsigned char tgt[3][PKMAX] = {{0}};
     for (int a = 0; a < g_lcn; a++)
         if (g_lc[a].keep) tgt[g_lc[a].slot][g_lc[a].k] = 1;
-    for (int i = 0; i < 2; i++) {
-        if (s_slotpk[i] < 0) continue;
-        if (i == 1 && s_slotpk[1] == s_slotpk[0]) continue;
+    for (int i = 0; i < 3; i++) {
+        if (!slot_first(i)) continue;
         struct pack *s = &packs[s_slotpk[i]];
         for (int k = 0; k < s->n_lab && k < PKMAX; k++)
             s->lab_vis[k] += ((float)tgt[i][k] - s->lab_vis[k]) * ke;
     }
-    for (int i = 0; i < 2; i++) {                    // draw, batched per atlas
-        if (s_slotpk[i] < 0) continue;
-        if (i == 1 && s_slotpk[1] == s_slotpk[0]) continue;
+    // packs out of the slots fade their gates too: one coming back must
+    // not resume at the visibility it left with (its labels popped in)
+    for (int j = 0; ease && j < n_packs; j++) {
+        if (j == s_slotpk[0] || j == s_slotpk[1] || j == s_slotpk[2]) continue;
+        for (int k = 0; k < packs[j].n_lab && k < PKMAX; k++)
+            packs[j].lab_vis[k] -= packs[j].lab_vis[k] * ke;
+    }
+    for (int i = 0; i < 3; i++) {                    // draw, batched per atlas
+        if (!slot_first(i)) continue;
         struct pack *s = &packs[s_slotpk[i]];
         int bound = 0;
         for (int a = 0; a < g_lcn; a++) {
@@ -2709,7 +2727,7 @@ void engine_render(int w, int h, int primary) {
         (s_slotpk[0] >= 0 && packs[s_slotpk[0]].msx > 0.999) ? 1.0f : 0.0f,
         (s_slotpk[1] >= 0 && packs[s_slotpk[1]].msx > 0.999) ? 1.0f : 0.0f,
         (s_slotpk[2] >= 0 && packs[s_slotpk[2]].msx > 0.999) ? 1.0f : 0.0f);
-    for (int i = 0; i < 2; i++) {
+    for (int i = 0; i < 3; i++) {
         set_slot_uniforms(i);
         // contour scale + px-per-texel (needs this output's pixel height)
         struct pack *s = (s_slotpk[i] >= 0) ? &packs[s_slotpk[i]] : NULL;
@@ -2718,25 +2736,6 @@ void engine_render(int w, int h, int primary) {
             glUniform4f(u_ctr[i], s->elev_lo, s->elev_hi - s->elev_lo, s->step, ppt);
         } else {
             glUniform4f(u_ctr[i], 0.0f, 0.0f, 0.0f, 0.0f);
-        }
-    }
-    {   // guarantor slot: terrain-only uniforms
-        struct pack *s = (s_slotpk[2] >= 0) ? &packs[s_slotpk[2]] : NULL;
-        int okp = s && s->gl_ok;
-        glActiveTexture(GL_TEXTURE0 + UNIT_TER2);
-        glBindTexture(GL_TEXTURE_2D, okp ? s->ter_tex : ph_ter_tex);
-        glActiveTexture(GL_TEXTURE0);
-        double cx = okp ? (cam_x - s->mx0) / s->msx : 0.5;
-        double cy = okp ? 1.0 - (cam_y - s->my0) / s->msy : 0.5;
-        glUniform2f(u_texel2, okp ? 1.0f / (float)s->ter_w : 1.0f,
-                              okp ? 1.0f / (float)s->ter_h : 1.0f);
-        glUniform2f(u_tc2, (float)cx, (float)cy);
-        glUniform2f(u_ts2, okp ? (float)(1.0 / (2.0 * M_PI * s->msx)) : 0.0f,
-                           okp ? (float)(1.0 / (2.0 * M_PI * s->msy)) : 0.0f);
-        if (okp) {
-            glUniform4f(u_ctr2, s->elev_lo, s->elev_hi - s->elev_lo, 0.0f, 0.0f);
-        } else {
-            glUniform4f(u_ctr2, 0.0f, 1.0f, 0.0f, 0.0f);
         }
     }
     glBindBuffer(GL_ARRAY_BUFFER, vbo);
