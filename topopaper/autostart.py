@@ -167,9 +167,19 @@ def read(path):
 
 
 # ---- sway --------------------------------------------------------------------------
+def _shell_default(m):
+    # ${NAME:-fallback}: the form distro default configs use for config.d
+    name, fallback = m[1], m[2]
+    if name == "XDG_CONFIG_HOME":
+        return str(config_home())
+    return os.environ.get(name) or fallback
+
+
 def _expand(pattern, base):
     home = str(Path.home())
     p = pattern.strip().strip('"').strip("'")
+    p = p.replace("$HOME", home).replace("${HOME}", home)
+    p = re.sub(r"\$\{(\w+):-([^}]*)\}", _shell_default, p)
     p = p.replace("$XDG_CONFIG_HOME", str(config_home())).replace("${XDG_CONFIG_HOME}", str(config_home()))
     p = p.replace("$HOME", home).replace("${HOME}", home)
     p = os.path.expanduser(p)
@@ -306,10 +316,17 @@ _START_LINE = re.compile(r"^\s*(exec(_always)?|exec-once|spawn-at-startup|Exec=)
 def _config_files(comp):
     """Config files a compositor reads at startup (main file + includes)."""
     if comp == "sway":
-        files = [sway_config()]
-        for pat in sway_includes(sway_config()):
-            if pat.startswith(str(Path.home())):
-                files += [Path(f) for f in sorted(glob.glob(pat))]
+        # SwayFX setups often start from ~/.config/swayfx/config, which then
+        # includes the sway config; follow includes a few levels deep
+        files, todo = [], [sway_config(), config_home() / "swayfx" / "config"]
+        while todo and len(files) < 200:
+            f = todo.pop(0)
+            if f in files or not f.is_file():
+                continue
+            files.append(f)
+            for pat in sway_includes(f):
+                if pat.startswith(str(Path.home())):
+                    todo += [Path(g) for g in sorted(glob.glob(pat))]
         return files
     if comp == "hyprland":
         files = [hypr_config()]
