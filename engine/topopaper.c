@@ -38,10 +38,10 @@
 //     Every slot shades with one shared scale and the roads/lifts/borders
 //     composite as one layer that appears once its scale fills the view, so
 //     overlapping packs hand over without showing their rectangles. Only
-//     packs whose bbox INTERSECTS THE VIEW
-//     are candidates — same-scale SIBLING packs elsewhere on the map (Tetons
-//     vs Wind Rivers) never blend in by height alone, and a cross-country
-//     flight naturally picks up each area it overflies. slot0 is always the
+//     packs whose bbox INTERSECTS THE VIEW are candidates — same-scale
+//     SIBLING packs elsewhere on the map (Tetons vs Wind Rivers) never
+//     blend in by height alone, and a cross-country flight naturally picks
+//     up each area it overflies. slot0 is always the
 //     DOMINANT pack.
 //   * fly-to (a new name in the area file) runs a van Wijk–Nuij path to the
 //     target's live idle camera; a long dive naturally sweeps through every
