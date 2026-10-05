@@ -50,6 +50,13 @@ static int    raised = 0;           // 24H2 layout
 static int    layered = 0;          // our windows are WS_EX_LAYERED
 // TOPA_WIN_ATTACH (diagnostics): progman (24H2 default), worker, worker-layered, top
 static const char *attach_mode = "";
+// 24H2: GL can't present into the layered child (DWM never shows it), but
+// GDI painting can, as the icons' own layered window does. So there the
+// frame is drawn by GL as usual, read back and painted with GDI.
+// TOPA_WIN_PRESENT=swap|gdi overrides.
+static int present_gdi = 0;
+static unsigned char *gdi_px = NULL;
+static size_t gdi_cap = 0;
 static UINT   msg_taskbar = 0;
 static int    rebuild = 1;
 static const wchar_t *VIEW_CLASS = L"topopaperView";
@@ -237,6 +244,8 @@ static void gl_load(void) {
 static void build_views(void) {
     destroy_views();
     int desk = attach_desktop();
+    const char *pm = getenv("TOPA_WIN_PRESENT");
+    present_gdi = pm ? !strcmp(pm, "gdi") : (desk && layered);
     EnumDisplayMonitors(NULL, NULL, add_monitor, 0);
     HINSTANCE inst = GetModuleHandleW(NULL);
     for (int i = 0; i < n_views; i++) {
@@ -287,9 +296,9 @@ static void build_views(void) {
             engine_gl_init();
         }
         ShowWindow(hw, SW_SHOWNOACTIVATE);
-        fprintf(stderr, "topopaper: drawing on %s (%dx%d%s%s%s)\n", v->name, v->w, v->h,
+        fprintf(stderr, "topopaper: drawing on %s (%dx%d%s%s%s%s)\n", v->name, v->w, v->h,
                 desk ? (raised ? ", desktop layer 24H2" : ", desktop layer") : ", bottom window",
-                attach_mode[0] ? ", attach " : "", attach_mode);
+                present_gdi ? ", GDI present" : "", attach_mode[0] ? ", attach " : "", attach_mode);
     }
     if (desk) dump_tree(FindWindowW(L"Progman", NULL), 0);
 }
@@ -359,6 +368,27 @@ static int all_covered(void) {
 }
 
 // ---- main loop ----------------------------------------------------------------------
+static void present_frame(struct view *v) {
+    size_t need = (size_t)v->w * v->h * 4;
+    if (need > gdi_cap) {
+        free(gdi_px);
+        gdi_px = malloc(need);
+        gdi_cap = gdi_px ? need : 0;
+        if (!gdi_px) return;
+    }
+    glPixelStorei(GL_PACK_ALIGNMENT, 4);
+    glReadPixels(0, 0, v->w, v->h, GL_BGRA, GL_UNSIGNED_BYTE, gdi_px);
+    BITMAPINFO bi;
+    memset(&bi, 0, sizeof bi);
+    bi.bmiHeader.biSize = sizeof bi.bmiHeader;
+    bi.bmiHeader.biWidth = v->w;
+    bi.bmiHeader.biHeight = v->h;            // bottom-up, like GL's rows
+    bi.bmiHeader.biPlanes = 1;
+    bi.bmiHeader.biBitCount = 32;
+    bi.bmiHeader.biCompression = BI_RGB;
+    SetDIBitsToDevice(v->dc, 0, 0, v->w, v->h, 0, 0, 0, v->h, gdi_px, &bi, DIB_RGB_COLORS);
+}
+
 static void frame(void) {
     int prim = -1;
     long best = -1;
@@ -373,7 +403,8 @@ static void frame(void) {
         int i = (prim + k) % n_views;       // primary first: it eases shared state
         if (!views[i].hwnd || !wglMakeCurrent(views[i].dc, glrc)) continue;
         engine_render(views[i].w, views[i].h, i == prim);
-        SwapBuffers(views[i].dc);
+        if (present_gdi) present_frame(&views[i]);
+        else SwapBuffers(views[i].dc);
     }
 }
 

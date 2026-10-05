@@ -141,8 +141,9 @@ jobs:
           Add-Type -AssemblyName System.Windows.Forms, System.Drawing
           $exe = "$env:LOCALAPPDATA\Programs\topopaper\bin\topopaper.exe"
           $py = "$env:LOCALAPPDATA\topopaper\venv\Scripts\python.exe"
-          foreach ($m in "progman", "worker", "worker-layered", "top") {
-            $env:TOPA_WIN_ATTACH = $m; $env:TOPA_WIN_DEBUG = "1"
+          foreach ($v in "progman/gdi", "progman/swap", "worker-layered/gdi", "worker/swap") {
+            $m = $v.Replace("/", "-")
+            $env:TOPA_WIN_ATTACH, $env:TOPA_WIN_PRESENT = $v.Split("/"); $env:TOPA_WIN_DEBUG = "1"
             $p = Start-Process $exe -PassThru -RedirectStandardError "shots\attach-$m.log"
             Start-Sleep 10
             $b = [System.Windows.Forms.SystemInformation]::VirtualScreen
@@ -154,7 +155,7 @@ jobs:
             Start-Sleep 2
             "== $m"; Get-Content "shots\attach-$m.log" | Select-String "drawing on|vis="
           }
-          Remove-Item Env:TOPA_WIN_ATTACH, Env:TOPA_WIN_DEBUG
+          Remove-Item Env:TOPA_WIN_ATTACH, Env:TOPA_WIN_PRESENT, Env:TOPA_WIN_DEBUG
       - name: Session on the real desktop
         shell: pwsh
         run: |
