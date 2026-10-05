@@ -9,7 +9,7 @@ OS differences kept in `topopaper/system.py`, `paths.py` and `autostart.py`.
 | | Linux | Windows | macOS |
 |---|---|---|---|
 | backend | `wayland.c`: wlr-layer-shell, EGL + GLES2 | `win32.c`: child windows in the desktop's wallpaper layer, WGL (OpenGL 2.0+) | `macos.m`: desktop-level windows, NSOpenGL 2.1 |
-| behind the desktop icons | n/a | yes | yes (Finder icons stay above) |
+| behind the desktop icons | n/a | yes (see 24H2 below) | yes (Finder icons stay above) |
 | pauses when covered | watcher per compositor (`topopaper.watch`) | engine: a window maximized or covering 95% of a monitor's work area, on every monitor | engine: window occlusion state |
 | battery frame rate | sysfs | `GetSystemPowerStatus` | IOKit power sources |
 | starts at login | compositor config / systemd unit | registry `HKCU\…\Run` | LaunchAgent |
@@ -31,6 +31,17 @@ and re-attaches when Explorer restarts (`TaskbarCreated`), when monitors
 change, or when the `WorkerW` is replaced. Without an Explorer desktop
 (Wine, some kiosk setups) it falls back to borderless windows pinned to the
 bottom of the z-order.
+
+On the 24H2 layout the desktop can accept the windows without DWM ever
+showing them. The Windows Server 2025 runner (build 26100) does this whether
+the frame comes from GL, GDI or `UpdateLayeredWindow`, and Lively Wallpaper
+users report the same on some 24H2 and 25H2 builds. So a few seconds after
+attaching, the engine compares points of the screen that no app window
+covers with its own frame (`the desktop shows N of M sampled points` in
+`engine.log`). If the desktop shows none of it, the engine switches to the
+bottom-window mode. That mode is visible under every app, but it hides the
+desktop icons. `TOPA_WIN_ATTACH=window` forces it, and `TOPA_WIN_DEBUG=1`
+logs the desktop's window tree.
 
 Files: the program lives in `%LOCALAPPDATA%\Programs\topopaper` (`bin\` +
 `share\topopaper\`, the same shape as a Unix prefix), maps and state in

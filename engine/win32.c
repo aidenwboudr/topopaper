@@ -12,8 +12,10 @@
 //     WorkerW and SHELLDLL_DefView are children of Progman. Microsoft's
 //     guidance: a WS_EX_LAYERED child of Progman (alpha 255), stacked right
 //     under the icons, with the WorkerW kept at the bottom.
-// Without a usable desktop (no Explorer shell, Wine) the windows fall back to
-// plain borderless windows kept at the bottom of the z-order.
+// Without a usable desktop (no Explorer shell, Wine), or when the desktop
+// takes our windows but never shows them (visibility_check: seen on Windows
+// Server 2025), the windows fall back to plain borderless windows kept at
+// the bottom of the z-order: under every app, but over the desktop icons.
 //
 // Explorer restarts (the TaskbarCreated broadcast), monitor changes
 // (WM_DISPLAYCHANGE) and a vanished parent rebuild everything. The windows
