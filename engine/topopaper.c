@@ -130,6 +130,7 @@ static GLuint prog, vbo;
 static GLint a_pos;
 static GLint u_res, u_crawlm, u_cpu, u_night, u_w;
 static GLint u_texel2, u_tc2, u_ts2, u_ctr2, u_fam;
+static GLint u_dbg = -1;
 static GLint u_radpx, u_globec, u_wrap, u_sun, u_sunh, u_snow, u_aur;
 // city lights (lights.bin: world cities for the globe's night side)
 #define MAXLTS 8192
@@ -368,7 +369,20 @@ static void cfg_poll(int force) {
     }
 }
 
-static double now_sec(void) { return mono_sec() - t_start; }
+// TOPA_REC=<dir>: flight recorder for seam hunting (tests/flight-rec.sh). A
+// virtual clock advances exactly 1/TOPA_REC_FPS (default 30) per frame however
+// slow the renderer, every frame of the primary display lands in <dir> as
+// fNNNNN.ppm with a matching camera/weights line in <dir>/trace.txt, and
+// TOPA_REC_FLY=a,b,... flies to each pack in turn (TOPA_REC_HOLD seconds,
+// default 1, after start and after each landing settles), then quits.
+// TOPA_REC_DBG=N: every Nth frame also dumps dNNNNN_1.ppm (each pixel's
+// slot shares as rgb) and dNNNNN_2..4.ppm (slot 0, 1, 2 rendered alone).
+static int    g_rec = 0, rec_frame_n = 0, rec_was_flying = 0, rec_dbg = 0;
+static double rec_t = 0.0, rec_dt = 1.0 / 30.0, rec_hold = 1.0, rec_next = 0.0;
+static char   rec_dir[400], rec_fly[512];
+static FILE  *rec_trace = NULL;
+
+static double now_sec(void) { return g_rec ? rec_t : mono_sec() - t_start; }
 static double smooth01(double x) {           // smoothstep
     if (x < 0) x = 0;
     if (x > 1) x = 1;
@@ -1315,6 +1329,7 @@ static const char *FRAG =
     "uniform vec3 uBgLo, uBgHi, uLnLo, uLnHi, uWatC, uShoreC, uSnowC, uWarmC;\n"
     "uniform vec3 uRimC, uIceC, uAurA, uAurB;\n"
     "uniform vec3 uWrap;\n"                  // per-slot: 1 = full-world pack, wrap u
+    "uniform float uDbg;\n"                  // TOPA_REC_DBG: 1 slot shares, 2-4 slot 0-2 alone
     "uniform sampler2D uTer0, uFeat0, uTer1, uFeat1, uWat0, uWat1, uTer2;\n"
     "uniform vec2 uTexel0, uTC0, uTS0;\n"
     "uniform vec2 uTexel1, uTC1, uTS1;\n"
@@ -1554,6 +1569,10 @@ static const char *FRAG =
     "      w2v=uW.z*cov2;\n"
     "    }\n"
     "    float tot=w0v+w1v+w2v;\n"
+    "    if(uDbg>0.5){\n"
+    "      gl_FragColor=vec4(uDbg<1.5?vec3(w0v,w1v,w2v)/max(tot,1e-4)\n"
+    "                        :uDbg<2.5?c0:uDbg<3.5?c1:c2, 1.0);\n"
+    "      return; }\n"
     "    vec3 terr=(tot>1e-4)?(c0*w0v+c1*w1v+c2*w2v)/tot:bg;\n"
     "    terr*=0.72+0.28*z;\n"          // limb darkening; ==1.0 up close
     // dusk band: warm cast where the sun grazes the terminator's day side
@@ -1710,6 +1729,7 @@ void engine_gl_init(void) {
     u_fam     = glGetUniformLocation(prog, "uFam");
     glUniform1i(glGetUniformLocation(prog, "uTer2"), UNIT_TER2);
     u_radpx   = glGetUniformLocation(prog, "uRadPx");
+    u_dbg     = glGetUniformLocation(prog, "uDbg");
     u_globec  = glGetUniformLocation(prog, "uGlobeC");
     u_sun     = glGetUniformLocation(prog, "uSun");
     u_sunh    = glGetUniformLocation(prog, "uSunH");
@@ -2160,6 +2180,17 @@ static void step_world(void) {
             a >= 0 ? packs[a].name : "-", w0v,
             b >= 0 ? packs[b].name : "-", w1v,
             gg >= 0 ? packs[gg].name : "-", w2v);
+        if (rec_trace) {                     // TOPA_REC: every rung's weight
+            fprintf(rec_trace, "%d %d %.4f %.9g %.9g %.9g slots=%s:%.4f,%s:%.4f,%s:%.4f w=",
+                    rec_frame_n, fly_active, fly_active == 1 ? fly_t / fly_T : 0.0,
+                    cam_h, cam_x, cam_y,
+                    a >= 0 ? packs[a].name : "-", w0v, b >= 0 ? packs[b].name : "-", w1v,
+                    gg >= 0 ? packs[gg].name : "-", w2v);
+            for (int k = 0; k < nslw; k++)
+                fprintf(rec_trace, "%s%s:%.4f", k ? "," : "", packs[idxw[k]].name, wsl[k]);
+            fputc('\n', rec_trace);
+            fflush(rec_trace);
+        }
     }
 
     // ---- view centre on the sphere (EVERY frame — there is only one
@@ -2610,6 +2641,45 @@ static void maybe_shot(int w, int h) {
     g_running = 0;
 }
 
+// TOPA_REC: write this frame (see g_rec)
+static void rec_capture(int w, int h, const char *name) {
+    static unsigned char *px = NULL, *row = NULL;
+    static size_t cap = 0;
+    if ((size_t)w * h * 4 > cap) {
+        cap = (size_t)w * h * 4;
+        px = realloc(px, cap);
+        row = realloc(row, (size_t)w * 3);
+    }
+    if (!px || !row) return;
+    char path[480];
+    snprintf(path, sizeof path, "%s/%s.ppm", rec_dir, name);
+    FILE *f = fopen(path, "wb");
+    if (!f) return;
+    glPixelStorei(GL_PACK_ALIGNMENT, 1);
+    glReadPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, px);
+    fprintf(f, "P6\n%d %d\n255\n", w, h);
+    for (int y = h - 1; y >= 0; y--) {
+        const unsigned char *s = px + (size_t)y * w * 4;
+        for (int x = 0; x < w; x++) memcpy(row + x * 3, s + x * 4, 3);
+        fwrite(row, 1, (size_t)w * 3, f);
+    }
+    fclose(f);
+}
+
+// TOPA_REC: start each listed flight once the camera has idled rec_hold
+// seconds, quit once the last one has landed and settled
+static void rec_schedule(void) {
+    if (fly_active || pending_area[0]) { rec_was_flying = 1; rec_next = -1.0; return; }
+    if (rec_was_flying || rec_next < 0.0) { rec_was_flying = 0; rec_next = rec_t + rec_hold; }
+    if (rec_t < rec_next || !cam_init) return;
+    if (!rec_fly[0]) { g_running = 0; return; }
+    char *c = strchr(rec_fly, ',');
+    size_t n = c ? (size_t)(c - rec_fly) : strlen(rec_fly);
+    snprintf(pending_area, sizeof pending_area, "%.*s", (int)n, rec_fly);
+    memmove(rec_fly, c ? c + 1 : rec_fly + n, strlen(c ? c + 1 : rec_fly + n) + 1);
+    rec_was_flying = 1;
+}
+
 // Draw the current world state into the current surface (w x h pixels).
 // `primary` = the output whose geometry the world step used (the largest);
 // only it eases shared state.
@@ -2780,6 +2850,25 @@ void engine_render(int w, int h, int primary) {
         glUseProgram(prog);
     }
     if (primary) maybe_shot(w, h);
+    if (primary && g_rec) {
+        char nm[32];
+        snprintf(nm, sizeof nm, "f%05d", rec_frame_n);
+        rec_capture(w, h, nm);
+        if (rec_dbg > 0 && rec_frame_n % rec_dbg == 0) {
+            // the slot shares, then each slot's colour alone (same frame)
+            glBindBuffer(GL_ARRAY_BUFFER, vbo);
+            glEnableVertexAttribArray(a_pos);
+            glVertexAttribPointer(a_pos, 2, GL_FLOAT, GL_FALSE, 0, 0);
+            for (int d = 1; d <= 4; d++) {
+                glUniform1f(u_dbg, (float)d);
+                glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+                snprintf(nm, sizeof nm, "d%05d_%d", rec_frame_n, d);
+                rec_capture(w, h, nm);
+            }
+            glUniform1f(u_dbg, 0.0f);
+        }
+        rec_frame_n++;
+    }
 }
 
 
@@ -2800,7 +2889,7 @@ static double frame_min_dt(void) {
 }
 
 double engine_now(void) { return now_sec(); }
-double engine_next_frame(void) { return t_prev + frame_min_dt(); }
+double engine_next_frame(void) { return g_rec ? now_sec() : t_prev + frame_min_dt(); }
 int    engine_layer_background(void) { return cfg.layer_background; }
 
 void engine_poll(void) {
@@ -2818,6 +2907,7 @@ void engine_poll(void) {
 void engine_step(int w, int h) {
     g_ar = (double)w / (double)(h > 0 ? h : 1);
     g_scr_h = h;
+    if (g_rec) { rec_t += rec_dt; rec_schedule(); }
 
     // deferred pack work (needs the GL context current)
     theme_apply();
@@ -2913,6 +3003,19 @@ static void resolve_paths(void) {
 void engine_setup(void) {
     install_signals();
     t_start = mono_sec();
+    const char *rd = getenv("TOPA_REC");
+    if (rd && *rd) {
+        g_rec = 1;
+        snprintf(rec_dir, sizeof rec_dir, "%s", rd);
+        const char *v = getenv("TOPA_REC_FLY");
+        snprintf(rec_fly, sizeof rec_fly, "%s", v ? v : "");
+        if ((v = getenv("TOPA_REC_FPS")) && atof(v) > 0.0) rec_dt = 1.0 / atof(v);
+        if ((v = getenv("TOPA_REC_HOLD")) && atof(v) >= 0.0) rec_hold = atof(v);
+        if ((v = getenv("TOPA_REC_DBG"))) rec_dbg = atoi(v);
+        char tp[480];
+        snprintf(tp, sizeof tp, "%s/trace.txt", rec_dir);
+        rec_trace = fopen(tp, "w");
+    }
     srand((unsigned)(time(NULL) ^ getpid()));
     resolve_paths();
     cfg_poll(0);
