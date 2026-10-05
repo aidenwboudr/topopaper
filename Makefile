@@ -44,7 +44,7 @@ WIN_RC    ?= x86_64-w64-mingw32-windres
 WIN_SRC    = $(CORE_SRC) engine/win32.c
 
 # install MODE SRC DST, making DST's directory (BSD install on macOS has no -D)
-INST = sh -c 'mkdir -p "$$(dirname "$$3")" && cp "$$2" "$$3" && chmod "$$1" "$$3"' inst
+INST = sh -c 'mkdir -p "$$(dirname "$$3")" && cp "$$2" "$$3.new" && chmod "$$1" "$$3.new" && mv -f "$$3.new" "$$3"' inst
 
 .PHONY: all install uninstall clean check protocols windows dist-windows
 
