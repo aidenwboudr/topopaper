@@ -1,0 +1,6 @@
+ok    dive: worst edge 6.7 (frame 160, synth-area-east); worst tone 22.8 (frame 170, synth-region|synth-area-east); worst pop 4.1; worst void 0.000 (frame None)
+ok    hop: worst edge 12.2 (frame 200, synth-area); worst tone 21.7 (frame 160, synth-area-east|synth-region); worst pop 3.5; worst void 0.000 (frame None)
+ok    back: worst edge 10.8 (frame 100, synth-area-east); worst tone 20.3 (frame 140, synth-area-east|synth-region); worst pop 4.2; worst void 0.000 (frame None)
+ok    wide: worst edge 7.9 (frame 160, synth-area-east); worst tone 22.4 (frame 155, synth-region|synth-area-east); worst pop 4.0; worst void 0.000 (frame None)
+ok    up: worst edge 9.6 (frame 205, synth-region); worst tone 23.9 (frame 165, synth-region|synth-area-east); worst pop 3.3; worst void 0.000 (frame None)
+exit=0
