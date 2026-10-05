@@ -25,22 +25,29 @@
 // (phase += speed*dt) and uniforms are smoothed with dt-scaled EMAs.
 //
 // A REGISTRY of every pack (metas scanned when the areas dir changes,
-// textures uploaded lazily, LRU-capped) is arranged on a LADDER by scale:
+// textures streamed in on demand, LRU-capped) is arranged on a LADDER by
+// scale:
 //
 //   * camera lives in normalized WEB-MERCATOR (x east, y south) — centre +
 //     view height. Idle = Ken-Burns breathing around the pack focus point.
 //   * each frame the ladder rungs covering the view are weighted by
 //     continuous laws of the camera state (sharpness yield, view overlap,
-//     territory between same-scale siblings — see step_world), and the top
-//     three fill the shader slots. Only packs whose bbox INTERSECTS THE VIEW
+//     territory between same-scale siblings — see ladder_weights), and the
+//     top three fill shader slots 0-2; slot 3 holds the finest pack covering
+//     the whole view during flights, so no part of the screen is ever bare.
+//     Every slot shades with one shared scale and the roads/lifts/borders
+//     composite as one layer, so overlapping packs hand over without
+//     showing their rectangles. Only packs whose bbox INTERSECTS THE VIEW
 //     are candidates — same-scale SIBLING packs elsewhere on the map (Tetons
 //     vs Wind Rivers) never blend in by height alone, and a cross-country
 //     flight naturally picks up each area it overflies. slot0 is always the
 //     DOMINANT pack.
 //   * fly-to (a new name in the area file) runs a van Wijk–Nuij path to the
-//     target's idle camera; a long dive naturally sweeps through every
-//     intermediate rung's imagery (rungs along the way preloaded at takeoff).
-//     Flights run at max(fps, 30); covered-freeze pauses them mid-air.
+//     target's live idle camera; a long dive naturally sweeps through every
+//     intermediate rung's imagery. The packs the path will draw on are
+//     predicted at takeoff and streamed in row strips between frames, so no
+//     frame stalls on an upload. Flights run at max(fps, 30); covered-freeze
+//     pauses them mid-air.
 //   * AUTO-ROAM: after a randomized stretch of atlas idle (mean roam_minutes,
 //     0 = off, battery stretches x1.6) the engine writes another pack's name
 //     into the area file itself — the ordinary watcher then flies there.
@@ -62,7 +69,8 @@
 // Debug env: TOPA_SUN_T=<epoch> pins the sun, TOPA_DEBUG=1 traces the camera
 // per frame, TOPA_NOHUD=1 drops the HUD, TOPA_POWER_DIR fakes the sysfs
 // power_supply tree, TOPA_SHOT=<file.ppm> saves the first display's frame
-// after TOPA_SHOT_T seconds (default 8) and exits.
+// after TOPA_SHOT_T seconds (default 8) and exits, TOPA_REC=<dir> records
+// flights frame by frame (see g_rec; tests/flight-rec.sh drives it).
 #include "platform.h"
 #include "themes.h"
 #include <stdio.h>
