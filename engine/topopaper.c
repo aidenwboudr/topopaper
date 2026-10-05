@@ -384,11 +384,12 @@ static void cfg_poll(int force) {
 // slow the renderer, every frame of the primary display lands in <dir> as
 // fNNNNN.ppm with a matching camera/weights line in <dir>/trace.txt, and
 // TOPA_REC_FLY=a,b,... flies to each pack in turn (TOPA_REC_HOLD seconds,
-// default 1, after start and after each landing settles), then quits.
+// default 1, after start and after each landing settles), then quits
+// (or after TOPA_REC_FRAMES frames).
 // TOPA_REC_DBG=N: every Nth frame also dumps gNNNNN.ppm (the map before the
 // labels), dNNNNN_1.ppm (each pixel's slot 0-2 shares as rgb, magenta where
 // nothing covers) and dNNNNN_2..5.ppm (slot 0, 1, 2, 3 rendered alone).
-static int    g_rec = 0, rec_frame_n = 0, rec_was_flying = 0, rec_dbg = 0;
+static int    g_rec = 0, rec_frame_n = 0, rec_was_flying = 0, rec_dbg = 0, rec_max = 0;
 static double rec_t = 0.0, rec_dt = 1.0 / 30.0, rec_hold = 1.0, rec_next = 0.0;
 static char   rec_dir[400], rec_fly[512];
 static FILE  *rec_trace = NULL;
@@ -1710,10 +1711,12 @@ static const char *FRAG =
     "    }\n"
     "    float tot=w0v+w1v+w2v+w3v;\n"
     "    if(uDbg>0.5){\n"                       // void = magenta
-    "      gl_FragColor=vec4(uDbg<1.5?(tot>1e-4?vec3(w0v,w1v,w2v)/tot:vec3(1.0,0.0,1.0))\n"
+    "      gl_FragColor=vec4(uDbg<1.5?(tot>0.0?vec3(w0v,w1v,w2v)/tot:vec3(1.0,0.0,1.0))\n"
     "                        :uDbg<2.5?c0:uDbg<3.5?c1:uDbg<4.5?c2:c3, 1.0);\n"
     "      return; }\n"
-    "    vec3 terr=(tot>1e-4)?(c0*w0v+c1*w1v+c2*w2v+c3*w3v)/tot:bg;\n"
+    // tot is never 0 on screen (the container covers); at a bbox's very
+    // edge it can be tiny, so only an exact 0 falls back to slot 0's edge
+    "    vec3 terr=(tot>0.0)?(c0*w0v+c1*w1v+c2*w2v+c3*w3v)/tot:c0;\n"
     // FEATURE LAYER: roads, runs, lifts and borders composite on top of the
     // blended terrain instead of riding each slot's share, so a pack's road
     // network never shows as a faint rectangle while it covers only part of
@@ -2189,8 +2192,8 @@ static int view_container(double cx, double cy, double ch) {
     double vx0 = cx - ch * g_ar * 0.5, vx1 = cx + ch * g_ar * 0.5;
     double vy0 = cy - ch * 0.5, vy1 = cy + ch * 0.5;
     // margin ~ the sphere's edge distortion (angular view size squared),
-    // less a hair so an idle view touching its own pack's edge counts
-    double th = ch * 2.0 * M_PI, mf = th * th * 0.25 - 1e-3;
+    // less rounding slop so an idle view touching its own pack's edge counts
+    double th = ch * 2.0 * M_PI, mf = th * th * 0.25 - 1e-9;
     if (mf > 0.1) mf = 0.1;
     double mx = mf * (vx1 - vx0), my = mf * (vy1 - vy0);
     for (int k = 0; k < n_lad; k++) {                    // fine -> coarse
@@ -2426,7 +2429,7 @@ static void step_world(void) {
                                      vx0, vy0, vx1, vy1, varea);
             }
             if (packs[pi].msx > 0.999) uni = 1.0;
-            g_fg[i] = (float)(smooth01((uni - 0.6) / 0.35) * smooth01(wvs[i] / 0.15));
+            g_fg[i] = (float)(smooth01((uni - 0.45) / 0.5) * smooth01(wvs[i] / 0.15));
             for (int j = 0; j < 4; j++) {
                 int pj = s_slotpk[j];
                 if (j != i && pj >= 0 && pj != pi && packs[pj].msy < gm * 0.95)
@@ -2975,6 +2978,7 @@ static void rec_capture(int w, int h, const char *name) {
 // TOPA_REC: start each listed flight once the camera has idled rec_hold
 // seconds, quit once the last one has landed and settled
 static void rec_schedule(void) {
+    if (rec_max > 0 && rec_frame_n >= rec_max) { g_running = 0; return; }
     if (fly_active || pending_area[0]) { rec_was_flying = 1; rec_next = -1.0; return; }
     if (rec_was_flying || rec_next < 0.0) { rec_was_flying = 0; rec_next = rec_t + rec_hold; }
     if (rec_t < rec_next || !cam_init) return;
@@ -3309,6 +3313,7 @@ void engine_setup(void) {
         if ((v = getenv("TOPA_REC_FPS")) && atof(v) > 0.0) rec_dt = 1.0 / atof(v);
         if ((v = getenv("TOPA_REC_HOLD")) && atof(v) >= 0.0) rec_hold = atof(v);
         if ((v = getenv("TOPA_REC_DBG"))) rec_dbg = atoi(v);
+        if ((v = getenv("TOPA_REC_FRAMES"))) rec_max = atoi(v);
         char tp[480];
         snprintf(tp, sizeof tp, "%s/trace.txt", rec_dir);
         rec_trace = fopen(tp, "w");

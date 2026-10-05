@@ -36,7 +36,7 @@ trap 'kill $SWAY 2>/dev/null || true' EXIT
 for _ in $(seq 100); do [ -S "$XDG_RUNTIME_DIR/wayland-1" ] && break; sleep 0.1; done
 export WAYLAND_DISPLAY=wayland-1
 
-TOPA_SUN_T="${SUN_T:-1780077600}" TOPA_NOHUD=1 TOPA_REC_DBG="${DBG:-0}" TOPA_REC="$OUT" TOPA_REC_FLY="$FLY" \
+TOPA_SUN_T="${SUN_T:-1780077600}" TOPA_NOHUD=1 TOPA_REC_DBG="${DBG:-0}" TOPA_REC="$OUT" TOPA_REC_FLY="$FLY" TOPA_REC_HOLD="${HOLD:-1}" TOPA_REC_FRAMES="${TOPA_REC_FRAMES:-}" \
     "$ROOT/build/topopaper" > "$OUT/engine.log" 2>&1
 grep -h 'flight\|error\|warn' "$OUT/engine.log" || true
-echo "$(ls "$OUT" | grep -c '^f.*\.ppm$') frames in $OUT"
+echo "$(find "$OUT" -maxdepth 1 -name 'f*.ppm' | wc -l) frames in $OUT"
