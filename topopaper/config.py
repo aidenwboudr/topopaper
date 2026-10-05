@@ -28,6 +28,9 @@ SCHEMA = [
         doc="pack shown at start (and where 'home' flies to)"),
     Key("general", "roam_minutes", "8", "float",
         doc="mean minutes between automatic flights to another pack; 0 = stay put"),
+    Key("general", "flight_seconds", "20", "float",
+        doc="how long a flight between maps takes (seconds); a long globe-to-valley "
+            "descent takes about this, shorter hops less"),
     Key("general", "animation_speed", "1.0", "float",
         doc="multiplier for drift, contour crawl and zoom breathing"),
 

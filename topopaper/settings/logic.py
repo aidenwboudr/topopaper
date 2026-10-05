@@ -248,6 +248,10 @@ def speed_label(v):
     return f"{float(v):.2g}×"
 
 
+def flight_label(v):
+    return f"{float(v):.0f} s"
+
+
 # ---- clock / weather --------------------------------------------------------
 def fmt_location(name, lat, lon):
     try:

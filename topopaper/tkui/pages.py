@@ -292,6 +292,9 @@ class MotionPage(Page):
         self.roam.bind("<<ComboboxSelected>>", self._roam_changed)
         self._roam_vals = []
         self._refreshers.append(self._roam_refresh)
+        self.slider(card, "flight_seconds", "Flight length",
+                    "How long a trip between maps takes; longer is slower and "
+                    "more cinematic", 3, 45, 1, logic.flight_label)
         self.slider(card, "animation_speed", "Animation speed",
                     "Drift, contour crawl and zoom breathing", 0.25, 2.0, 0.05,
                     logic.speed_label)

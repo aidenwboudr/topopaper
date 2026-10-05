@@ -249,7 +249,7 @@ static double roam_mean_min = 8.0;          // config roam_minutes; <=0 disables
 // consumers that need to react once (shader palette, output set, ...).
 static struct {
     char   home_area[64];
-    double roam_minutes, animation_speed;
+    double roam_minutes, animation_speed, flight_seconds;
     char   theme[32];
     int    city_lights, aurora, labels, react_to_cpu;
     int    show_clock, clock_24h, show_weather, show_news;
@@ -266,7 +266,7 @@ static char   cache_dir[400];
 static void cfg_defaults(void) {
     memset(&cfg, 0, sizeof cfg);
     snprintf(cfg.home_area, sizeof cfg.home_area, "earth");
-    cfg.roam_minutes = 8.0; cfg.animation_speed = 1.0;
+    cfg.roam_minutes = 8.0; cfg.animation_speed = 1.0; cfg.flight_seconds = 20.0;
     snprintf(cfg.theme, sizeof cfg.theme, "macchiato");
     cfg.city_lights = cfg.aurora = cfg.labels = cfg.react_to_cpu = 1;
     cfg.show_clock = cfg.show_weather = cfg.show_news = 1;
@@ -295,6 +295,11 @@ static void cfg_set(const char *k, const char *v) {
 #undef STR
 #undef BOOL
     if (!strcmp(k, "roam_minutes")) { cfg.roam_minutes = atof(v); return; }
+    if (!strcmp(k, "flight_seconds")) {
+        double a = atof(v);
+        cfg.flight_seconds = a < 2.0 ? 2.0 : a > 120.0 ? 120.0 : a;
+        return;
+    }
     if (!strcmp(k, "animation_speed")) {
         double a = atof(v);
         cfg.animation_speed = a < 0.0 ? 0.0 : a > 4.0 ? 4.0 : a;
@@ -1087,9 +1092,15 @@ static void start_flight(int tgt) {
         r1   = log(-b1 + sqrt(b1 * b1 + 1.0));
         f_S = (r1 - f_r0) / RHO;
     }
-    fly_T = 2.5 + 2.2 * fabs(f_S);
-    if (fly_T < 3.5) fly_T = 3.5;
-    if (fly_T > 9.0) fly_T = 9.0;
+    // Duration follows the configured flight length. The van Wijk path effort
+    // |f_S| sizes each trip within that: a long globe-to-valley descent takes
+    // about the full flight_seconds, shorter hops proportionally less, with a
+    // floor so a tiny re-centre never crawls (and never snaps).
+    double frac = fabs(f_S) / 2.3;           // 2.3 ~ a globe-scale descent
+    if (frac > 1.0) frac = 1.0;
+    if (frac < 0.3) frac = 0.3;
+    fly_T = cfg.flight_seconds * frac;
+    if (fly_T < 1.0) fly_T = 1.0;
     fly_t = 0.0;
     fly_active = 1;
     g_vis = 0.0; roam_next = -1.0;           // roam clock restarts per flight
