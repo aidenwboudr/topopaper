@@ -213,3 +213,54 @@ def test_distro_style_include_and_swayfx_entry(tmp_path, monkeypatch):
     assert autostart.sway_dropin_ok("auto.conf")
     st = autostart.status()
     assert st["enabled"] and "auto.conf" in st["detail"]
+
+
+def _sway_home(tmp_path, monkeypatch, own):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+    monkeypatch.setenv("TOPOPAPER_COMPOSITOR", "sway")
+    monkeypatch.setattr(autostart, "reload_compositor", lambda comp: None)
+    d = tmp_path / ".config" / "sway" / "config.d"
+    d.mkdir(parents=True)
+    (tmp_path / ".config" / "sway" / "config").write_text(
+        "set $mod Mod4\ninclude ~/.config/sway/config.d/*.conf\n")
+    (d / "keys.conf").write_text(own)
+    return d
+
+
+def test_keybind_own_search_line_is_on_and_not_duplicated(tmp_path, monkeypatch):
+    d = _sway_home(tmp_path, monkeypatch,
+                   "bindsym $mod+Shift+b exec ~/.local/bin/topopaper-ctl search\n")
+    st = autostart.keybind_status()
+    assert st["enabled"] and "keys.conf" in st["detail"]
+    ok, msg = autostart.keybind_add()
+    assert ok and "already" in msg
+    assert not (d / "topopaper-keys.conf").exists()      # no second binding written
+    ok, msg = autostart.keybind_remove()
+    assert not ok and "your own line" in msg
+
+
+def test_keybind_refuses_keys_bound_to_something_else(tmp_path, monkeypatch):
+    d = _sway_home(tmp_path, monkeypatch, "bindsym --release Mod4+Shift+B exec firefox\n")
+    ok, msg = autostart.keybind_add("Super+Shift+B")
+    assert not ok and "already bound" in msg and "firefox" in msg
+    assert not (d / "topopaper-keys.conf").exists()
+    ok, _ = autostart.keybind_add("Super+Alt+M")             # free keys still work
+    assert ok and (d / "topopaper-keys.conf").exists()
+    assert autostart.keybind_status()["enabled"]
+
+
+def test_hyprland_duplicate_detection(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+    monkeypatch.setenv("TOPOPAPER_COMPOSITOR", "hyprland")
+    monkeypatch.setattr(autostart, "reload_compositor", lambda comp: None)
+    h = tmp_path / ".config" / "hypr"
+    h.mkdir(parents=True)
+    (h / "hyprland.conf").write_text("$mainMod = SUPER\nbind = $mainMod SHIFT, B, exec, firefox\n")
+    ok, msg = autostart.keybind_add()
+    assert not ok and "already bound" in msg
+    ok, _ = autostart.keybind_add("Super+Ctrl+B")
+    assert ok
+    ok, msg = autostart.keybind_add("Super+Ctrl+B")          # re-adding our own is fine
+    assert ok
