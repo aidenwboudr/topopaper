@@ -141,7 +141,7 @@ jobs:
           Add-Type -AssemblyName System.Windows.Forms, System.Drawing
           $exe = "$env:LOCALAPPDATA\Programs\topopaper\bin\topopaper.exe"
           $py = "$env:LOCALAPPDATA\topopaper\venv\Scripts\python.exe"
-          foreach ($v in "progman/ulw", "progman/gdi", "worker-layered/ulw", "none/swap") {
+          foreach ($v in "below-hide/swap", "below/swap", "progman/swap", "none/swap") {
             $m = $v.Replace("/", "-")
             $env:TOPA_WIN_ATTACH, $env:TOPA_WIN_PRESENT = $v.Split("/"); $env:TOPA_WIN_DEBUG = "1"
             $p = Start-Process $exe -PassThru -RedirectStandardError "shots\attach-$m.log"

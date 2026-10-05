@@ -50,6 +50,10 @@ static int    raised = 0;           // 24H2 layout
 static int    layered = 0;          // our windows are WS_EX_LAYERED
 // TOPA_WIN_ATTACH (diagnostics): progman (24H2 default), worker, worker-layered, top
 static const char *attach_mode = "";
+// "below" (24H2 experiment): top-level windows right under Progman, whose
+// wallpaper WorkerW is hidden so Progman (no surface of its own) shows them
+static HWND below = NULL;           // Progman, when sitting under it
+static HWND hidden_worker = NULL;   // the WorkerW we hid (shown again on exit)
 // 24H2: GL can't present into the layered child (DWM never shows it), but
 // GDI painting can, as the icons' own layered window does. So there the
 // frame is drawn by GL as usual, read back and painted with GDI.
@@ -157,9 +161,9 @@ static LRESULT CALLBACK view_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
     case WM_ERASEBKGND: return 1;
     case WM_PAINT: ValidateRect(h, NULL); return 0;
     case WM_WINDOWPOSCHANGING:
-        if (!parent) {                                 // fallback: stay at the bottom
+        if (!parent) {                                 // stay at the bottom / under Progman
             WINDOWPOS *wp = (WINDOWPOS *)l;
-            wp->hwndInsertAfter = HWND_BOTTOM;
+            wp->hwndInsertAfter = below ? below : HWND_BOTTOM;
             wp->flags &= ~SWP_NOZORDER;
         }
         break;
@@ -244,6 +248,16 @@ static void gl_load(void) {
 static void build_views(void) {
     destroy_views();
     int desk = strcmp(attach_mode, "none") ? attach_desktop() : 0;
+    below = NULL;
+    if (desk && !strncmp(attach_mode, "below", 5)) {
+        below = FindWindowW(L"Progman", NULL);
+        if (!strcmp(attach_mode, "below-hide") && worker && IsWindowVisible(worker)) {
+            hidden_worker = worker;
+            ShowWindow(worker, SW_HIDE);
+        }
+        desk = 0;
+        parent = NULL;
+    }
     const char *pm = getenv("TOPA_WIN_PRESENT");
     present_ulw = pm && !strcmp(pm, "ulw");
     present_gdi = pm ? (present_ulw || !strcmp(pm, "gdi")) : (desk && layered);
@@ -275,7 +289,7 @@ static void build_views(void) {
             hw = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT,
                                  VIEW_CLASS, L"topopaper", WS_POPUP,
                                  v->rc.left, v->rc.top, v->w, v->h, NULL, NULL, inst, NULL);
-            if (hw) SetWindowPos(hw, HWND_BOTTOM, 0, 0, 0, 0,
+            if (hw) SetWindowPos(hw, below ? below : HWND_BOTTOM, 0, 0, 0, 0,
                                  SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
         }
         if (!hw) { fprintf(stderr, "topopaper: CreateWindow failed (%lu)\n", GetLastError()); continue; }
@@ -486,6 +500,7 @@ int main(void) {
         }
     }
     destroy_views();
+    if (hidden_worker && IsWindow(hidden_worker)) ShowWindow(hidden_worker, SW_SHOWNA);
     if (glrc) wglDeleteContext(glrc);
     repaint_desktop();
     if (ctl) DestroyWindow(ctl);
