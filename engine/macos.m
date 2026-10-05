@@ -8,6 +8,9 @@
 // windows' occlusion state tells the engine when apps cover the wallpaper.
 #define GL_SILENCE_DEPRECATION 1
 #import <Cocoa/Cocoa.h>
+// NSOpenGL and its NSView hooks are deprecated (still shipped): this backend
+// is built on them on purpose
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
 #include "platform.h"
 #include <math.h>
 

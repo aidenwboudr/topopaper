@@ -7,6 +7,9 @@ import pytest  # noqa: E402
 
 from topopaper import autostart  # noqa: E402
 
+# compositor config files: Linux (Path.home() ignores $HOME on Windows)
+pytestmark = pytest.mark.skipif(sys.platform == "win32", reason="Linux compositors")
+
 EXE = "/opt/tp/bin/topopaper-session"
 CTL = "/opt/tp/bin/topopaper-ctl"
 SYSTEMCTL = []

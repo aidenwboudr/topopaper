@@ -47,8 +47,6 @@ def compositor(env=None):
     forced = env.get("TOPOPAPER_COMPOSITOR")
     if forced:
         return forced
-    if not system.LINUX:
-        return system.name()
     desk = env.get("XDG_CURRENT_DESKTOP", "").lower().split(":")
     if env.get("SWAYSOCK") or "sway" in desk:
         return "sway"
@@ -58,7 +56,7 @@ def compositor(env=None):
         return "niri"
     if "kde" in desk or env.get("KDE_FULL_SESSION"):
         return "kde"
-    return "other"
+    return "other" if system.LINUX else system.name()
 
 
 def launcher(name):
