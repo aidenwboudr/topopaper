@@ -193,6 +193,8 @@ def pops(rec, tr):
     d = np.stack(diffs)                       # frames x 8 x 8
     out = []
     for n in range(2, len(d) - 2):
+        if any(k not in tr for k in range(n - 2, n + 3)):
+            continue                          # the map isn't up yet
         ctx = np.median(np.stack([d[n - 2], d[n - 1], d[n + 1], d[n + 2]]), axis=0)
         ex = d[n] - ctx                       # change beyond the motion trend
         k = np.unravel_index(np.argmax(ex), ex.shape)
@@ -215,6 +217,7 @@ def main():
                  for p in glob.glob(f"{a.rec}/d*_1.ppm"))
     worst_t, worst_v = (0.0, None, None), (0.0, None)
     print("frame  tau    h          tone  void   pair")
+    dbg = [n for n in dbg if n in tr]         # untraced = before any pack loaded
     for n in dbg:
         v, where, vd = tone(a.rec, n, tr, a.maps)
         r = tr[n]

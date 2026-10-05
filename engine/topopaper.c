@@ -1557,11 +1557,17 @@ static const char *FRAG =
     // once the view outsizes the pack — the bbox edge then reads as a hard
     // LOD wall against the coarse rung (the tetons west-edge chunk). Clamped
     // low so a deep overhang can never feather a sole cover provider to zero.
+    // A token tail reaches 2 px past the edge: where the sphere's corners
+    // overhang every pack by a pixel or two, the nearest edge texels fill in
+    // (elsewhere it is a 1e-4 share).
     "float slotCov(vec2 uv, vec2 texel){\n"
-    "  vec2 m=clamp(fwidth(uv)*80.0, texel*2.5, vec2(0.2));\n"
+    "  vec2 fw=fwidth(uv);\n"
+    "  vec2 m=clamp(fw*80.0, texel*2.5, vec2(0.2));\n"
     "  vec2 f=max(max(m-uv, uv-(1.0-m)), vec2(0.0))/m;\n"
     "  float d=max(f.x, f.y);\n"
-    "  return 1.0-smoothstep(0.0, 1.0, d); }\n"
+    "  vec2 o=max(-uv, uv-1.0)/max(fw, vec2(1e-12));\n"   // px outside
+    "  float tail=1e-4*(1.0-smoothstep(0.0, 2.0, max(o.x, o.y)));\n"
+    "  return max(1.0-smoothstep(0.0, 1.0, d), tail); }\n"
     // one contour family: line intensity at step s for absolute metres hm,
     // with the fwidth anti-moiré damper doubling as the data-quality floor
     // (families too fine for a slot's texels self-suppress)
@@ -2197,19 +2203,43 @@ static int ladder_weights(double cx, double cy, double ch, double *ovl,
 }
 
 // The coverage container for a camera: the finest pack whose bbox holds the
-// whole view (plus a margin for the sphere's curvature) — earth at worst.
+// whole visible ground — earth at worst. The footprint is un-projected from
+// points along the screen border exactly as the shader projects (a mercator
+// rectangle of the view height misses the sphere's latitude scale by about
+// a pixel at the screen edge: a bare row there); slotCov's 2 px tail covers
+// what falls between the points.
 static int view_container(double cx, double cy, double ch) {
-    double vx0 = cx - ch * g_ar * 0.5, vx1 = cx + ch * g_ar * 0.5;
-    double vy0 = cy - ch * 0.5, vy1 = cy + ch * 0.5;
-    // margin ~ the sphere's edge distortion (angular view size squared),
-    // less rounding slop so an idle view touching its own pack's edge counts
-    double th = ch * 2.0 * M_PI, mf = th * th * 0.25 - 1e-9;
-    if (mf > 0.1) mf = 0.1;
-    double mx = mf * (vx1 - vx0), my = mf * (vy1 - vy0);
+    double glat = atan(sinh(M_PI * (1.0 - 2.0 * cy)));
+    if (glat >  1.05) glat =  1.05;                      // as step_world
+    if (glat < -1.05) glat = -1.05;
+    double sla = sin(glat), cla = cos(glat);
+    double hq = 0.5 * ch * 2.0 * M_PI * cla;             // half screen height in q
+    double x0 = 1e9, x1 = -1e9, y0 = 1e9, y1 = -1e9;
+    for (int i = 0; i < 16; i++) {                       // the border, 16 points
+        double t = (i % 4) / 3.0, ex, ey;
+        switch (i / 4) {
+            case 0:  ex = -1.0 + 2.0 * t; ey = -1.0; break;
+            case 1:  ex = -1.0 + 2.0 * t; ey =  1.0; break;
+            case 2:  ex = -1.0; ey = -1.0 + 2.0 * t; break;
+            default: ex =  1.0; ey = -1.0 + 2.0 * t; break;
+        }
+        double qx = ex * g_ar * hq, qy = ey * hq;
+        double r2 = qx * qx + qy * qy;
+        if (r2 >= 1.0) return lad[n_lad - 1];            // past the limb: the globe
+        double z = sqrt(1.0 - r2);
+        double lat = asin(qy * cla + z * sla);
+        double lon = atan2(qx, z * cla - qy * sla);
+        double mx = cx + lon / (2.0 * M_PI);
+        double my = 0.5 - log(tan(M_PI / 4.0 + lat / 2.0)) / (2.0 * M_PI);
+        if (mx < x0) x0 = mx;
+        if (mx > x1) x1 = mx;
+        if (my < y0) y0 = my;
+        if (my > y1) y1 = my;
+    }
     for (int k = 0; k < n_lad; k++) {                    // fine -> coarse
         struct pack *p = &packs[lad[k]];
-        if ((p->msx > 0.999 || (p->mx0 <= vx0 - mx && p->mx0 + p->msx >= vx1 + mx)) &&
-            p->my0 <= vy0 - my && p->my0 + p->msy >= vy1 + my) return lad[k];
+        if ((p->msx > 0.999 || (p->mx0 <= x0 && p->mx0 + p->msx >= x1)) &&
+            p->my0 <= y0 && p->my0 + p->msy >= y1) return lad[k];
     }
     return lad[n_lad - 1];                               // the coarsest (earth)
 }
@@ -2402,9 +2432,10 @@ static void step_world(void) {
     // ski sites outweighed yellowstone-region). Where others cover, the
     // token is a ~1% share; where nothing else does, it is the picture.
 #define CONTAIN_EPS 0.01
-    int cont = view_container(cam_x, cam_y, cam_h);
+    // (idle views stay inside their pack by construction: no extra slot)
+    int cont = fly_active ? view_container(cam_x, cam_y, cam_h) : -1;
     double w3v = 0.0;
-    if (cont == a || cont == b || cont == gg || !ensure_pack_gl(cont)) cont = -1;
+    if (cont < 0 || cont == a || cont == b || cont == gg || !ensure_pack_gl(cont)) cont = -1;
     else w3v = CONTAIN_EPS;
     if (w0v < 1e-4) w0v = 1e-4;
     if (a < 0) a = p_cur >= 0 ? p_cur : lad[0];
