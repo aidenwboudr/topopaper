@@ -104,7 +104,7 @@ class OverpassLoadShed(Exception):
     # empty result as if the region were empty.
     pass
 
-def overpass(q):
+def overpass(q, tries=7):
     # 429/outage-resilient: sticky endpoint + rotation + progressive backoff
     # (rate limits hit VPN exit IPs hard; mirrors have their own bad nights)
     global _op_last_ok, _op_last_t
@@ -112,7 +112,7 @@ def overpass(q):
     if wait > 0:
         time.sleep(wait)
     delay = 8.0
-    for attempt in range(7):
+    for attempt in range(tries):
         url = OVERPASS_ENDPOINTS[(_op_last_ok + attempt) % len(OVERPASS_ENDPOINTS)]
         try:
             req = urllib.request.Request(
@@ -128,7 +128,7 @@ def overpass(q):
             _op_last_t = time.time()
             raise
         except Exception as e:
-            if attempt == 6:
+            if attempt == tries - 1:
                 raise
             print(f"  overpass retry in {delay:.0f}s "
                   f"({url.split('/')[2]}: {e})", flush=True)
@@ -1046,9 +1046,13 @@ def declutter(entries, top_n, sep_px, key):
             break
     return kept
 
+PEAK_BOX_MAX = 20.0        # degrees: bigger boxes are split before asking
+
 def _peaks_fetch(box, ef, depth=0):
     # continental boxes die in the SCAN phase no matter the (if:) filter —
-    # on load-shed, quadtree-split until each box fits the server's budget
+    # quadtree-split until each box fits the server's budget: up front for
+    # boxes over PEAK_BOX_MAX, and whenever a box is shed or keeps timing
+    # out (a gateway timeout on a busy mirror is a shed by another name)
     s, w, n, e = box
     # peak OR volcano: the great volcanoes (Shasta, Mauna Kea, Mauna Loa,
     # Haleakalā...) are natural=volcano and were invisible to a peak-only
@@ -1056,12 +1060,15 @@ def _peaks_fetch(box, ef, depth=0):
     # to this one missing tag
     q = (f'[out:json][timeout:120];node["natural"~"^(peak|volcano)$"]'
          f'["name"]{ef}({s:.5f},{w:.5f},{n:.5f},{e:.5f});out;')
+    big = max(n - s, e - w) > PEAK_BOX_MAX and depth < 3
     try:
-        return overpass(q).get("elements", [])
-    except OverpassLoadShed:
+        if big:
+            raise OverpassLoadShed("box too big to ask in one go")
+        return overpass(q, tries=7 if depth >= 3 else 3).get("elements", [])
+    except (OverpassLoadShed, OSError) as exc:      # OSError: timeouts, 5xx
         if depth >= 3:
             raise
-        print(f"  peaks: overpass shed {n-s:.0f}x{e-w:.0f} deg box, "
+        print(f"  peaks: {n-s:.0f}x{e-w:.0f} deg box not answered ({exc}), "
               f"splitting (depth {depth})", flush=True)
         cy, cx = (s + n) / 2, (w + e) / 2
         els, seen = [], set()
@@ -1543,9 +1550,13 @@ def main(argv=None):
 
     entries = []
     if "peaks" in want:
-        entries += labels_peaks(bbox_s, to_px, elev, meta, a.peak_min_ele,
-                                a.peak_top, a.peak_sep,
-                                msy if a.peak_gate else 0.0)
+        try:
+            entries += labels_peaks(bbox_s, to_px, elev, meta, a.peak_min_ele,
+                                    a.peak_top, a.peak_sep,
+                                    msy if a.peak_gate else 0.0)
+        except (OverpassLoadShed, OSError) as e:
+            # like places: a map without peak names beats no map at all
+            print(f"  peaks: Overpass unavailable — building WITHOUT peak labels ({e})")
     if "places" in want:
         entries += labels_places(bbox_s, to_px, meta)
     if "places-region" in want:
