@@ -495,6 +495,61 @@ def niri_bind(keys, cmd_argv):
     return f"{'+'.join([MODS[m][2] for m in mods] + [_keyname(key, True)])} {{ spawn {args}; }}"
 
 
+_MOD_NORM = {"mod4": "super", "super": "super", "logo": "super", "win": "super",
+             "meta": "super", "mod": "super", "mod1": "alt", "alt": "alt",
+             "ctrl": "ctrl", "control": "ctrl", "shift": "shift"}
+
+
+def _norm_combo(tokens):
+    """['Mod4', 'Shift', 'b'] -> 'b+shift+super' (order-free, case-free)."""
+    *mods, key = [t.strip().lower() for t in tokens if t.strip()]
+    return "+".join([key] + sorted(_MOD_NORM.get(m, m) for m in mods))
+
+
+def existing_binds(comp=None):
+    """[(combo, file, line)] for every key binding in the user's config —
+    not topopaper's own marked block — with variables resolved
+    (`set $mod Mod4`, `$mainMod = SUPER`)."""
+    comp = comp or compositor()
+    out = []
+    if comp not in ("sway", "hyprland"):
+        return out
+    files = _config_files(comp)
+    var = {}
+    for f in files:                          # variables first, from every file
+        for ln in read(f).splitlines():
+            m = (re.match(r"\s*set\s+(\$\w+)\s+(\S+)", ln) if comp == "sway"
+                 else re.match(r"\s*(\$\w+)\s*=\s*(.+?)\s*$", ln))
+            if m:
+                var[m[1]] = m[2]
+
+    def subst(t):
+        for k in sorted(var, key=len, reverse=True):
+            t = t.replace(k, var[k])
+        return t
+    for f in files:
+        for ln in strip_block(read(f), "topopaper keybind").splitlines():
+            st = ln.strip()
+            if comp == "sway":
+                m = re.match(r"bindsym\s+((?:--\S+\s+)*)(\S+)", st)
+                if m:
+                    out.append((_norm_combo(subst(m[2]).split("+")), str(f), st))
+            else:
+                m = re.match(r"bind\w*\s*=\s*([^,]*),\s*([^,]+),", st)
+                if m:
+                    mods = subst(m[1]).replace("_", " ").split()
+                    out.append((_norm_combo(mods + [m[2]]), str(f), st))
+    return out
+
+
+def _own_search_bind(comp):
+    """A binding the user wrote that already runs the search: (file, line) or None."""
+    for _, f, ln in existing_binds(comp):
+        if "topopaper-ctl search" in ln:
+            return f, ln
+    return None
+
+
 KDE_HOWTO = ("Plasma keeps custom shortcuts in its own settings: open System Settings > "
              "Keyboard > Shortcuts > Add New > Command or Script, enter "
              "`{cmd} search`, and give it {keys}.")
@@ -517,6 +572,11 @@ def keybind_status():
     for ln in read(Path(where)).splitlines() if where else []:
         if "search" in ln and not ln.strip().startswith(("#", "//")):
             keys = ln.strip()
+    if not where:
+        own = _own_search_bind(comp)
+        if own:
+            return {"enabled": True, "supported": True, "managed": False,
+                    "detail": f"set by your own line in {own[0]}", "line": own[1]}
     return {"enabled": bool(where), "supported": True, "detail": where or "not set up",
             "line": keys}
 
@@ -526,7 +586,18 @@ def keybind_add(keys=DEFAULT_KEYS):
     ctl = launcher("topopaper-ctl")
     tag = "topopaper keybind"
     try:
-        parse_keys(keys)
+        mods, key = parse_keys(keys)
+        if comp in ("sway", "hyprland"):
+            want = _norm_combo(mods + [key])
+            for combo, f, ln in existing_binds(comp):
+                if combo != want:
+                    continue
+                if "topopaper-ctl search" in ln:
+                    return True, f"{keys} already opens the place search (your own line in {f})"
+                # a second binding for the same keys is a config error in
+                # sway (the red bar) and fires both commands in Hyprland
+                return False, (f"{keys} is already bound in {f}:\n  {ln}\n"
+                               "Remove that binding or pick other keys.")
         if comp == "sway":
             _, where = _sway_add([sway_bind(keys, f"{ctl} search")], tag, "topopaper-keys.conf")
             reload_compositor(comp)
@@ -570,6 +641,10 @@ def keybind_remove():
             done.append(str(niri_config()))
     except OSError as e:
         return False, f"could not remove the keybinding: {e}"
+    own = _own_search_bind(compositor())
+    if own:
+        return False, (f"the shortcut is set by your own line in {own[0]} — "
+                       "remove that line to turn it off")
     return True, ("removed the keybinding from " + ", ".join(done)) if done else "no keybinding was set"
 
 

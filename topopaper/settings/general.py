@@ -168,6 +168,8 @@ class GeneralPage(Page):
             self._syncing = False
             detail = st.get("detail") or ""
             method = st.get("method") or ""
+            if method == "own-config":
+                method = ""                  # the detail already says so in words
             self.auto.set_subtitle(GLib.markup_escape_text(
                 " · ".join(x for x in (method, detail) if x) or
                 "Starts the wallpaper when you log in"))
