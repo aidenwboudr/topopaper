@@ -196,3 +196,20 @@ def test_own_start_line_counts_as_enabled(tmp_path, monkeypatch):
     assert st["enabled"] is True and st["method"] == "own-config"
     ok, msg = autostart.disable()
     assert ok is False and "your own line" in msg
+
+
+def test_distro_style_include_and_swayfx_entry(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+    monkeypatch.setenv("TOPOPAPER_COMPOSITOR", "sway")
+    cfg = tmp_path / ".config"
+    (cfg / "sway" / "config.d").mkdir(parents=True)
+    (cfg / "swayfx").mkdir()
+    (cfg / "sway" / "config").write_text(
+        'include "${XDG_CONFIG_HOME:-$HOME/.config}/sway/config.d/*.conf"\n')
+    (cfg / "swayfx" / "config").write_text(f"include {cfg}/sway/config\n")
+    (cfg / "sway" / "config.d" / "auto.conf").write_text(
+        "exec_always --no-startup-id ~/.local/bin/topopaper-session\n")
+    assert autostart.sway_dropin_ok("auto.conf")
+    st = autostart.status()
+    assert st["enabled"] and "auto.conf" in st["detail"]
