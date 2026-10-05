@@ -177,7 +177,9 @@ jobs:
       - name: Build (warnings are errors)
         run: make CFLAGS="-O2 -Werror"
       - name: install.sh
-        run: ./install.sh --yes --no-launch
+        run: |
+          ./install.sh --yes --no-launch
+          test -x ~/Applications/Topopaper.app/Contents/MacOS/Topopaper
       - name: Unit tests
         run: |
           ~/.local/share/topopaper/venv/bin/python -m pip install -q pytest
@@ -202,7 +204,7 @@ jobs:
           cp ~/.local/state/topopaper/logs/*.log shots/session/ || true
           cat shots/session/session.log shots/session/engine.log || true
       - name: uninstall.sh
-        run: ./uninstall.sh --purge && test ! -e ~/.local/bin/topopaper
+        run: ./uninstall.sh --purge && test ! -e ~/.local/bin/topopaper && test ! -e ~/Applications/Topopaper.app
       - uses: actions/upload-artifact@v4
         if: always()
         with:

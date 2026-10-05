@@ -168,6 +168,7 @@ def test_key_conversion():
 
 def test_compositor_detection(monkeypatch):
     monkeypatch.delenv("TOPOPAPER_COMPOSITOR", raising=False)
+    monkeypatch.setattr(autostart.system, "LINUX", True)    # elsewhere "other" is the OS
     assert autostart.compositor({"XDG_CURRENT_DESKTOP": "sway"}) == "sway"
     assert autostart.compositor({"XDG_CURRENT_DESKTOP": "Hyprland"}) == "hyprland"
     assert autostart.compositor({"XDG_CURRENT_DESKTOP": "niri"}) == "niri"

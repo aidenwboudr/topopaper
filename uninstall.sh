@@ -34,6 +34,7 @@ for f in bin/topopaper bin/topopaper-ctl bin/topopaper-session bin/topopaper-set
     run rm -f "$PREFIX/$f"
 done
 run rm -rf "$PREFIX/share/topopaper"
+[ "$(uname -s)" = Darwin ] && rm -rf "$HOME/Applications/Topopaper.app"
 echo "topopaper removed from $PREFIX"
 
 data="${XDG_DATA_HOME:-$HOME/.local/share}/topopaper"

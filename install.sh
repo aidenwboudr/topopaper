@@ -260,6 +260,28 @@ case ":$PATH:" in
 esac
 CTL="$BIN/topopaper-ctl"
 
+# ---- 5b. macOS: an app in ~/Applications that opens the settings --------------
+if [ "$MACOS" = 1 ]; then
+    app="$HOME/Applications/Topopaper.app"
+    mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
+    cat > "$app/Contents/Info.plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>CFBundleName</key><string>Topopaper</string>
+  <key>CFBundleIdentifier</key><string>io.github.aidenwboudr.topopaper.settings</string>
+  <key>CFBundleExecutable</key><string>Topopaper</string>
+  <key>CFBundleIconFile</key><string>topopaper</string>
+  <key>CFBundlePackageType</key><string>APPL</string>
+</dict></plist>
+PLIST
+    printf '#!/bin/sh\nexec "%s/topopaper-settings" "$@"\n' "$BIN" > "$app/Contents/MacOS/Topopaper"
+    chmod 755 "$app/Contents/MacOS/Topopaper"
+    "$VENV/bin/python" -c 'import sys; from PIL import Image; Image.open(sys.argv[1]).save(sys.argv[2])' \
+        "$PREFIX/share/topopaper/icons/topopaper.ico" "$app/Contents/Resources/topopaper.icns" 2>/dev/null || true
+    ok "added $app"
+fi
+
 # ---- 6. starter globe --------------------------------------------------------
 if [ "$STARTER" = 1 ]; then
     say "Getting the starter globe (about 30 MB)"
