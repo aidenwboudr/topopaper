@@ -377,8 +377,7 @@ static int all_covered(void) {
 // which differs by a fraction of a contour's drift.
 static void visibility_check(struct view *v) {
     enum { G = 32 };
-    struct pt { int x, y; } pts[G * G];
-    int n = 0;
+    int pts[G * G][2], n = 0;
     RECT w = v->work;
     for (int j = 0; j < G; j++)
         for (int i = 0; i < G; i++) {
@@ -386,24 +385,45 @@ static void visibility_check(struct view *v) {
                         w.top + (w.bottom - w.top) * (2 * j + 1) / (2 * G) };
             HWND top = WindowFromPoint(p), root = top ? GetAncestor(top, GA_ROOT) : NULL;
             if (root && counts(root)) continue;  // an app window is in the way
-            pts[n].x = p.x; pts[n].y = p.y; n++;
+            pts[n][0] = p.x - v->rc.left; pts[n][1] = p.y - v->rc.top; n++;
         }
     if (n < 24) {                            // the desktop is mostly covered: later
         vis_check_at = ++vis_tries < 30 ? engine_now() + 10.0 : -1.0;
         return;
     }
     vis_check_at = -1.0;
-    HDC screen = GetDC(NULL);
+    // one copy of each: the screen (top-down DIB) and our frame (GL rows bottom-up)
+    size_t sz = (size_t)v->w * v->h * 4;
+    unsigned char *mine = malloc(sz);
+    BITMAPINFO bi;
+    memset(&bi, 0, sizeof bi);
+    bi.bmiHeader.biSize = sizeof bi.bmiHeader;
+    bi.bmiHeader.biWidth = v->w;
+    bi.bmiHeader.biHeight = -v->h;
+    bi.bmiHeader.biPlanes = 1;
+    bi.bmiHeader.biBitCount = 32;
+    bi.bmiHeader.biCompression = BI_RGB;
+    void *bits = NULL;
+    HDC screen = GetDC(NULL), mem = CreateCompatibleDC(screen);
+    HBITMAP bmp = CreateDIBSection(mem, &bi, DIB_RGB_COLORS, &bits, NULL, 0);
     int match = 0;
-    for (int k = 0; k < n; k++) {
-        unsigned char px[4];
-        glReadPixels(pts[k].x - v->rc.left, v->h - 1 - (pts[k].y - v->rc.top), 1, 1,
-                     GL_RGBA, GL_UNSIGNED_BYTE, px);
-        COLORREF c = GetPixel(screen, pts[k].x, pts[k].y);
-        if (c != CLR_INVALID && abs(GetRValue(c) - px[0]) < 40 &&
-            abs(GetGValue(c) - px[1]) < 40 && abs(GetBValue(c) - px[2]) < 40) match++;
+    if (mine && bmp && bits) {
+        HGDIOBJ old = SelectObject(mem, bmp);
+        BitBlt(mem, 0, 0, v->w, v->h, screen, v->rc.left, v->rc.top, SRCCOPY | CAPTUREBLT);
+        SelectObject(mem, old);
+        glPixelStorei(GL_PACK_ALIGNMENT, 4);
+        glReadPixels(0, 0, v->w, v->h, GL_RGBA, GL_UNSIGNED_BYTE, mine);
+        const unsigned char *scr = bits;
+        for (int k = 0; k < n; k++) {
+            const unsigned char *a = scr + ((size_t)pts[k][1] * v->w + pts[k][0]) * 4;          // BGRA
+            const unsigned char *b = mine + ((size_t)(v->h - 1 - pts[k][1]) * v->w + pts[k][0]) * 4; // RGBA
+            if (abs(a[2] - b[0]) < 40 && abs(a[1] - b[1]) < 40 && abs(a[0] - b[2]) < 40) match++;
+        }
     }
+    if (bmp) DeleteObject(bmp);
+    DeleteDC(mem);
     ReleaseDC(NULL, screen);
+    free(mine);
     fprintf(stderr, "topopaper: the desktop shows %d of %d sampled points of our frame\n", match, n);
     if (match * 3 < n) {
         fprintf(stderr, "topopaper: this desktop doesn't show its wallpaper layer's windows; "
