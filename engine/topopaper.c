@@ -1187,6 +1187,33 @@ static void stream_tick(void) {
     }
 }
 
+// van Wijk & Nuij path parameters from the departure camera (f_c0, f_w0)
+// to a target camera. Re-planned every frame toward the target's LIVE idle
+// pose (see step_world), in the asinh form that stays exact as the pan
+// distance shrinks to nothing (an ascent to the spinning globe starts as a
+// pure zoom that the spin then pulls sideways).
+static void plan_flight(double tx, double ty, double th) {
+    f_c1x = tx; f_c1y = ty; f_w1 = th;
+    double dx = f_c1x - f_c0x, dy = f_c1y - f_c0y;
+    f_d = sqrt(dx * dx + dy * dy);
+    if (f_d < 1e-14 * (f_w0 + f_w1)) {
+        f_pure = 1;
+        f_S = fabs(log(f_w1 / f_w0)) / RHO;
+        if (f_S < 1e-6) f_S = 1e-6;
+        f_ux = 0; f_uy = 0;
+    } else {
+        f_pure = 0;
+        f_ux = dx / f_d; f_uy = dy / f_d;
+        double r4 = RHO * RHO * RHO * RHO;
+        double b0 = (f_w1 * f_w1 - f_w0 * f_w0 + r4 * f_d * f_d) /
+                    (2.0 * f_w0 * RHO * RHO * f_d);
+        double b1 = (f_w1 * f_w1 - f_w0 * f_w0 - r4 * f_d * f_d) /
+                    (2.0 * f_w1 * RHO * RHO * f_d);
+        f_r0 = -asinh(b0);                   // = log(-b + sqrt(b*b + 1))
+        f_S = (asinh(b0) - asinh(b1)) / RHO;   // (r1 - r0) / RHO
+    }
+}
+
 static void start_flight(int tgt) {
     fly_tgt = tgt;
     g_fly_start = now_sec();
@@ -1203,27 +1230,9 @@ static void start_flight(int tgt) {
         if (s < -1.0) s = -1.0;
         ph_pb = asin(s);
     }
-    idle_cam(tgt, &f_c1x, &f_c1y, &f_w1);
-    double dx = f_c1x - f_c0x, dy = f_c1y - f_c0y;
-    f_d = sqrt(dx * dx + dy * dy);
-    if (f_d < 1e-12) {
-        f_pure = 1;
-        f_S = fabs(log(f_w1 / f_w0)) / RHO;
-        if (f_S < 1e-6) f_S = 1e-6;
-        f_ux = 0; f_uy = 0;
-    } else {
-        f_pure = 0;
-        f_ux = dx / f_d; f_uy = dy / f_d;
-        double r4 = RHO * RHO * RHO * RHO;
-        double b0 = (f_w1 * f_w1 - f_w0 * f_w0 + r4 * f_d * f_d) /
-                    (2.0 * f_w0 * RHO * RHO * f_d);
-        double b1 = (f_w1 * f_w1 - f_w0 * f_w0 - r4 * f_d * f_d) /
-                    (2.0 * f_w1 * RHO * RHO * f_d);
-        double r1;
-        f_r0 = log(-b0 + sqrt(b0 * b0 + 1.0));
-        r1   = log(-b1 + sqrt(b1 * b1 + 1.0));
-        f_S = (r1 - f_r0) / RHO;
-    }
+    double tx, ty, th;
+    idle_cam(tgt, &tx, &ty, &th);
+    plan_flight(tx, ty, th);
     // Duration follows the configured flight length. The van Wijk path effort
     // |f_S| sizes each trip within that: a long globe-to-valley descent takes
     // about the full flight_seconds, shorter hops proportionally less, with a
@@ -1269,7 +1278,8 @@ static void flight_cam(double s, double *ox, double *oy, double *oh) {
         return;
     }
     double rs = RHO * s + f_r0;
-    double u = (f_w0 / (RHO * RHO)) * (cosh(f_r0) * tanh(rs) - sinh(f_r0));
+    // cosh(r0)tanh(rs) - sinh(r0) == sinh(RHO s)/cosh(rs): no cancellation
+    double u = (f_w0 / (RHO * RHO)) * sinh(RHO * s) / cosh(rs);
     *oh = f_w0 * cosh(f_r0) / cosh(rs);
     *ox = f_c0x + f_ux * u;
     *oy = f_c0y + f_uy * u;
@@ -2294,22 +2304,21 @@ static void step_world(void) {
     if (fly_active == 1) {
         fly_t += mdt;
         double tau = fly_t / fly_T;
-        double s = f_S * smoother01(tau);
-        flight_cam(s, &cam_x, &cam_y, &cam_h);
-        // chase the LIVE idle pose: the wander/spin phases advance during
-        // the flight, so the pose targeted at start is stale by arrival —
-        // landing on it caused a visible correction pan in the landing
-        // blend (a quick pan at the end for no reason). Blend the target's
-        // drift in with progress: touchdown lands exactly on the current
-        // idle pose and the landing blend has nothing left to cover.
+        // aim at the LIVE idle pose: the wander/spin phases advance during
+        // the flight, so the pose targeted at start is stale by arrival
+        // (landing on it was a visible correction pan). Re-planning the path
+        // to it every frame lands exactly on the current pose, and the
+        // drift is absorbed where the path is zoomed out. (Adding the drift
+        // as an offset instead whipped the camera sideways near the ground:
+        // on an ascent to the globe the spin is dozens of views wide down
+        // there.)
         {
             double ix, iy, ih;
             idle_cam(fly_tgt, &ix, &iy, &ih);
-            double dk = smoother01(tau);
-            cam_x += (ix - f_c1x) * dk;
-            cam_y += (iy - f_c1y) * dk;
-            cam_h += (ih - f_w1) * dk;
+            plan_flight(ix, iy, ih);
         }
+        double s = f_S * smoother01(tau);
+        flight_cam(s, &cam_x, &cam_y, &cam_h);
         if (tau >= 1.0) {
             int m = 0;                       // the flight's prefetch is done
             for (int j = 0; j < g_npreq; j++)
