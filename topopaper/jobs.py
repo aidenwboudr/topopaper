@@ -10,7 +10,7 @@ import os
 import subprocess
 import time
 
-from . import paths, util
+from . import paths, system, util
 
 
 def jobs_dir():
@@ -39,21 +39,13 @@ def list_jobs():
             j = json.loads(f.read_text())
         except (OSError, ValueError):
             continue
-        alive = _alive(j.get("pid"))
+        alive = system.pid_alive(j.get("pid"))
         if j.get("state") == "running" and not alive:
             j["state"] = "failed"
             j["stage"] = "stopped unexpectedly"
         if alive or time.time() - j.get("t", 0) < 600:
             out.append(j)
     return out
-
-
-def _alive(pid):
-    try:
-        os.kill(int(pid), 0)
-        return True
-    except (OSError, TypeError, ValueError):
-        return False
 
 
 def start(plan):
@@ -63,7 +55,7 @@ def start(plan):
     cmd, env = util.ctl_cmd("build-place", json.dumps(plan))
     with open(lp, "w") as log:
         subprocess.Popen(cmd, env=env, stdout=log, stderr=subprocess.STDOUT,
-                         stdin=subprocess.DEVNULL, start_new_session=True)
+                         stdin=subprocess.DEVNULL, **system.detached())
     _status(plan["slug"], state="running", stage="starting", display=plan["display"])
     return lp
 

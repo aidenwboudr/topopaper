@@ -277,6 +277,8 @@ def refresh(verbose=False):
         tz = loc["tz"]
     lj = {"tz": tz, "lat": loc["lat"], "lon": loc["lon"],
           "place": loc.get("city") or "", "source": loc["source"], "ts": now}
+    if isinstance(fc.get("utc_offset_seconds"), int):
+        lj["utc_offset"] = fc["utc_offset_seconds"]   # for C runtimes without IANA zones
     util.write_atomic(str(paths.default_location_file()), json.dumps(lj, indent=1) + "\n")
     if verbose:
         print(text, end="")

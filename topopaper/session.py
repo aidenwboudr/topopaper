@@ -3,19 +3,21 @@
     engine     restarted when it crashes (backoff; gives up after repeated
                fast crashes and says so)
     watcher    `topopaper-ctl watch` (covered flag), restarted if it dies
+               (Linux; on Windows and macOS the engine sees occlusion itself)
     weather    built-in Open-Meteo fetch every 15 min, sooner after a failure,
                a network change or a resume from suspend
     starter    no packs at all -> fetch the starter globe once, in the background
+    hotkey     Windows: the search shortcut (search_hotkey), via RegisterHotKey
 
-One session per user (flock on $XDG_RUNTIME_DIR/topopaper-session.lock; the
+One session per user (a lock on <runtime dir>/topopaper-session.lock; the
 pid sits next to it). Signals: TERM/INT stop everything, USR1 restarts the
-engine (that is what `topopaper-ctl restart` sends). Log:
-$XDG_STATE_HOME/topopaper/logs/session.log (engine output: engine.log).
+engine (that is what `topopaper-ctl restart` sends). Windows has no signals:
+there `stop`/`restart` drop a request file next to the lock, polled every
+second. Log: <state dir>/logs/session.log (engine output: engine.log).
 
 No GUI toolkit here: the settings app imports this module for is_running(),
 start_detached(), restart() and stop().
 """
-import fcntl
 import logging
 import logging.handlers
 import os
@@ -27,7 +29,7 @@ import threading
 import time
 from pathlib import Path
 
-from . import config, paths, util
+from . import config, paths, system, util
 
 WEATHER_EVERY = 15 * 60
 WEATHER_RETRY = (60, 120, 300, 600)        # after failures, then back to 15 min
@@ -51,6 +53,11 @@ def pid_file():
     return paths.runtime_dir() / "topopaper-session.pid"
 
 
+def request_file(what):
+    """Windows: `stop`/`restart` request files the session polls."""
+    return paths.runtime_dir() / f"topopaper-session.{what}"
+
+
 def find_engine():
     """The engine binary: $TOPOPAPER_ENGINE, else beside the launcher
     ($TOPOPAPER_BIN, set by bin/topopaper-ctl), a source checkout's build/,
@@ -58,11 +65,13 @@ def find_engine():
     cands = []
     if os.environ.get("TOPOPAPER_ENGINE"):
         cands.append(Path(os.environ["TOPOPAPER_ENGINE"]))
+    exe = system.engine_name()
     if os.environ.get("TOPOPAPER_BIN"):
-        cands.append(Path(os.environ["TOPOPAPER_BIN"]) / "topopaper")
+        cands.append(Path(os.environ["TOPOPAPER_BIN"]) / exe)
     root = paths.PKG.parent
-    cands.append(root / "build" / "topopaper")               # <repo>/build/topopaper
-    cands.append(root.parent.parent / "bin" / "topopaper")   # $PREFIX/share/topopaper -> $PREFIX/bin
+    cands.append(root / "build" / exe)                       # <repo>/build/topopaper
+    cands.append(root / "build" / "windows" / exe)
+    cands.append(root.parent.parent / "bin" / exe)           # $PREFIX/share/topopaper -> $PREFIX/bin
     for c in cands:
         if c.is_file() and os.access(c, os.X_OK):
             return str(c)
@@ -81,11 +90,9 @@ def is_running():
     """True while a session holds the lock (a stale pid file doesn't count)."""
     try:
         with open(lock_file(), "a") as f:
-            try:
-                fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except OSError:
+            if not system.try_lock(f):
                 return True
-            fcntl.flock(f, fcntl.LOCK_UN)
+            system.unlock(f)
             return False
     except OSError:
         return False
@@ -93,7 +100,7 @@ def is_running():
 
 def session_cmd():
     _, env = util.ctl_cmd()
-    return [sys.executable, "-m", "topopaper.session"], env
+    return [system.gui_python(), "-m", "topopaper.session"], env
 
 
 def start_detached():
@@ -102,8 +109,8 @@ def start_detached():
     if is_running():
         return True
     cmd, env = session_cmd()
-    subprocess.Popen(cmd, env=env, start_new_session=True, stdin=subprocess.DEVNULL,
-                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    subprocess.Popen(cmd, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                     stderr=subprocess.DEVNULL, **system.detached())
     for _ in range(30):
         if is_running():
             return True
@@ -116,7 +123,10 @@ def restart(argv=None):
     pid = read_pid()
     if is_running() and pid:
         try:
-            os.kill(pid, signal.SIGUSR1)
+            if system.WINDOWS:
+                util.write_atomic(str(request_file("restart")), "1\n")
+            else:
+                os.kill(pid, signal.SIGUSR1)
             if argv is not None:
                 print("topopaper: restarting the wallpaper")
             return 0
@@ -137,7 +147,10 @@ def stop(argv=None, timeout=8.0):
             print("topopaper: no session running")
         return 0
     try:
-        os.kill(pid, signal.SIGTERM)
+        if system.WINDOWS:
+            util.write_atomic(str(request_file("stop")), "1\n")
+        else:
+            os.kill(pid, signal.SIGTERM)
     except OSError:
         pass
     end = time.monotonic() + timeout
@@ -159,7 +172,7 @@ def setup_logging(foreground):
                                              maxBytes=LOG_MAX, backupCount=1)
     h.setFormatter(logging.Formatter("%(asctime)s %(message)s", "%Y-%m-%d %H:%M:%S"))
     log.addHandler(h)
-    if foreground and sys.stderr.isatty():
+    if foreground and sys.stderr is not None and sys.stderr.isatty():
         log.addHandler(logging.StreamHandler())
     log.setLevel(logging.INFO)
 
@@ -176,20 +189,30 @@ def open_log(name):
 
 
 def die_with(sig):
-    """preexec_fn factory: the child gets `sig` if the session itself is
-    killed -9, so a crashed session never leaves an orphan engine drawing."""
+    """Popen kwargs: on Linux the child gets `sig` if the session itself is
+    killed -9, so a crashed session never leaves an orphan engine drawing.
+    (Elsewhere the engine watches TOPOPAPER_PARENT itself.)"""
+    if not system.LINUX:
+        return system.quiet()
+
     def pre():
         try:
             import ctypes
             ctypes.CDLL(None, use_errno=True).prctl(1, sig)     # PR_SET_PDEATHSIG
         except (OSError, AttributeError):
             pass
-    return pre
+    return {"preexec_fn": pre}
 
 
 def stop_proc(p, name, grace=3.0):
     if p is None or p.poll() is not None:
         return
+    if system.WINDOWS and name == "engine" and system.close_engine_windows():
+        try:                                # it hands the desktop back on WM_CLOSE
+            p.wait(grace)
+            return
+        except subprocess.TimeoutExpired:
+            pass
     p.terminate()
     try:
         p.wait(grace)
@@ -223,7 +246,7 @@ class Session:
         self.engine_started = 0.0
         self.fast_crashes = 0
         self.next_engine = 0.0
-        self.want_watch = watch
+        self.want_watch = watch and system.LINUX
         self.watcher = None
         self.watch_started = 0.0
         self.want_weather = weather
@@ -234,15 +257,17 @@ class Session:
         self.stopping = False
         self.restart_req = False
         self.net = net_signature()
+        self.hotkey = None                  # Windows: (keys, thread)
 
     # engine
     def start_engine(self):
         log.info("starting engine %s", self.engine_path)
         out = open_log("engine.log")
+        env = dict(os.environ, TOPOPAPER_PARENT=str(os.getpid()))
         try:
             self.engine = subprocess.Popen([self.engine_path], stdin=subprocess.DEVNULL,
-                                           stdout=out, stderr=subprocess.STDOUT,
-                                           preexec_fn=die_with(signal.SIGKILL))
+                                           stdout=out, stderr=subprocess.STDOUT, env=env,
+                                           **die_with(signal.SIGKILL))
         except OSError as e:
             log.info("engine failed to start: %s", e)
             self.engine = None
@@ -298,7 +323,7 @@ class Session:
         try:
             self.watcher = subprocess.Popen(cmd, env=env, stdin=subprocess.DEVNULL,
                                             stdout=out, stderr=subprocess.STDOUT,
-                                            preexec_fn=die_with(signal.SIGTERM))
+                                            **die_with(signal.SIGTERM))
         finally:
             out.close()
         self.watch_started = now
@@ -357,7 +382,40 @@ class Session:
         cmd, env = util.ctl_cmd("starter")
         with open_log("starter.log") as out:
             subprocess.Popen(cmd, env=env, stdin=subprocess.DEVNULL, stdout=out,
-                             stderr=subprocess.STDOUT, start_new_session=True)
+                             stderr=subprocess.STDOUT, **system.detached())
+
+    # Windows: requests from `topopaper-ctl stop/restart`, and the search hotkey
+    def check_requests(self):
+        for what in ("stop", "restart"):
+            f = request_file(what)
+            if f.exists():
+                try:
+                    f.unlink()
+                except OSError:
+                    pass
+                log.info("%s requested", what)
+                if what == "stop":
+                    self.stopping = True
+                else:
+                    self.restart_req = True
+
+    def check_hotkey(self):
+        from . import hotkey
+        keys = config.load().get("search_hotkey").strip()
+        cur = self.hotkey[0] if self.hotkey else ""
+        if keys == cur and (not self.hotkey or self.hotkey[1].is_alive()):
+            return
+        if self.hotkey:
+            hotkey.stop(self.hotkey[1])
+            self.hotkey = None
+        if keys:
+            self.hotkey = (keys, hotkey.start(keys, self.open_search))
+
+    def open_search(self):
+        cmd, env = util.ctl_cmd("search")
+        cmd[0] = system.gui_python()
+        subprocess.Popen(cmd, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, **system.detached())
 
     def run(self):
         self.maybe_starter()
@@ -370,6 +428,11 @@ class Session:
                 log.info("resumed from suspend")
                 self.weather_soon(now, 15, "resume")
             last_wall, last_mono = time.time(), now
+            if system.WINDOWS:
+                self.check_requests()
+                self.check_hotkey()
+            if self.stopping:
+                break
             if not self.check_engine(now):
                 break
             self.check_watch(now)
@@ -378,21 +441,23 @@ class Session:
         return self.stopping            # False: gave up on the engine
 
     def shutdown(self):
-        if self.engine is None and self.watcher is None:
+        if self.engine is None and self.watcher is None and not self.hotkey:
             return
         log.info("stopping")
         stop_proc(self.engine, "engine", ENGINE_GRACE)
         stop_proc(self.watcher, "watcher")
         self.engine = self.watcher = None
+        if self.hotkey:
+            from . import hotkey
+            hotkey.stop(self.hotkey[1])
+            self.hotkey = None
 
 
 def acquire_lock():
     """The open, flocked lock file, or None if a session already runs."""
     paths.runtime_dir().mkdir(parents=True, exist_ok=True)
     f = open(lock_file(), "a")
-    try:
-        fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except OSError:
+    if not system.try_lock(f):
         f.close()
         return None
     return f
@@ -428,8 +493,14 @@ def main(argv=None):
 
     signal.signal(signal.SIGTERM, on_stop)
     signal.signal(signal.SIGINT, on_stop)
-    signal.signal(signal.SIGHUP, on_stop)
-    signal.signal(signal.SIGUSR1, on_restart)
+    if not system.WINDOWS:
+        signal.signal(signal.SIGHUP, on_stop)
+        signal.signal(signal.SIGUSR1, on_restart)
+    for what in ("stop", "restart"):                # stale requests from a dead session
+        try:
+            request_file(what).unlink()
+        except OSError:
+            pass
     log.info("session %d up (engine %s)", os.getpid(), engine)
     ok = True
     try:

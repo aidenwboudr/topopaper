@@ -15,7 +15,6 @@ One backend per compositor, picked from the environment:
 Backends block on the compositor's event stream, recompute the state from a
 fresh query on each event, and reconnect after a pause when the IPC drops.
 """
-import fcntl
 import importlib
 import os
 import signal
@@ -81,6 +80,7 @@ def run_fallback(flag):
 
 
 def _lock():
+    import fcntl                            # Linux only, like the watcher
     f = open(paths.runtime_dir() / "topopaper-watch.lock", "w")
     try:
         fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -96,6 +96,9 @@ def main(argv=None):
         print("usage: topopaper-ctl watch [--backend NAME] [--once]\n\n"
               f"backends: {', '.join(BACKENDS)} (default: detected, now "
               f"'{detect()}')\n--once prints the current state and exits")
+        return 0
+    if sys.platform in ("win32", "darwin"):
+        print("not needed here: on Windows and macOS the wallpaper notices covering windows itself")
         return 0
     name = detect()
     if "--backend" in argv:

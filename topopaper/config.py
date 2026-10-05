@@ -65,8 +65,10 @@ SCHEMA = [
     Key("location", "place_name", "", "str"),
 
     Key("search", "launcher", "auto", "choice",
-        ("auto", "rofi", "fuzzel", "wofi", "tofi", "settings"),
-        doc="menu used by `topopaper-ctl search`"),
+        ("auto", "rofi", "fuzzel", "wofi", "tofi", "window", "settings"),
+        doc="menu used by `topopaper-ctl search` (window: topopaper's own search box)"),
+    Key("search", "search_hotkey", "", "str",
+        doc="Windows: global shortcut for the search, e.g. Super+Shift+B (`topopaper-ctl keybind add`)"),
 
     Key("advanced", "weather_file", "", "str",
         doc="read the HUD's weather from this file instead of the built-in fetcher"),

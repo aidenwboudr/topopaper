@@ -14,7 +14,7 @@ SCALE_NAMES = {0: "globe", 1: "hemisphere", **TIER_NAMES}
 
 ROAM_CHOICES = (0, 2, 5, 8, 15, 30, 60)
 
-LAUNCHERS = ("auto", "rofi", "fuzzel", "wofi", "tofi", "settings")
+LAUNCHERS = ("auto", "rofi", "fuzzel", "wofi", "tofi", "window", "settings")
 LAUNCHER_LABELS = {"auto": "Automatic", "settings": "This settings window"}
 
 

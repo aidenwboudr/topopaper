@@ -8,6 +8,8 @@ Every compositor wants this somewhere else:
     Hyprland     marked block (exec-once) in ~/.config/hypr/hyprland.conf
     niri         marked block (spawn-at-startup) in ~/.config/niri/config.kdl
     others       a systemd user unit bound to graphical-session.target
+    Windows      the HKCU ...\\CurrentVersion\\Run registry value "topopaper"
+    macOS        a LaunchAgent, ~/Library/LaunchAgents/<APP_ID>.plist
 
 A "marked block" sits between `# >>> topopaper >>>` and `# <<< topopaper <<<`
 (`//` in niri's KDL); a timestamped backup of the file is made before any
@@ -24,11 +26,13 @@ import sys
 import time
 from pathlib import Path
 
-from . import paths
+from . import config, paths, system
 
 DEFAULT_KEYS = "Super+Shift+B"
 DESKTOP_NAME = "topopaper.desktop"
 UNIT_NAME = "topopaper.service"
+APP_ID = "io.github.aidenwboudr.topopaper"
+RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 
 
 # ---- where things are -----------------------------------------------------------
@@ -37,11 +41,14 @@ def config_home():
 
 
 def compositor(env=None):
-    """sway | hyprland | niri | kde | other. TOPOPAPER_COMPOSITOR overrides."""
+    """sway | hyprland | niri | kde | other, or windows | macos.
+    TOPOPAPER_COMPOSITOR overrides."""
     env = os.environ if env is None else env
     forced = env.get("TOPOPAPER_COMPOSITOR")
     if forced:
         return forced
+    if not system.LINUX:
+        return system.name()
     desk = env.get("XDG_CURRENT_DESKTOP", "").lower().split(":")
     if env.get("SWAYSOCK") or "sway" in desk:
         return "sway"
@@ -277,6 +284,87 @@ def niri_with_binds(text, lines, tag):
     return base + "\n" + make_block(["binds {", *("    " + ln for ln in lines), "}"], tag, "//")
 
 
+# ---- Windows and macOS ----------------------------------------------------------------
+def launch_agent():
+    return Path.home() / "Library" / "LaunchAgents" / f"{APP_ID}.plist"
+
+
+def windows_session_cmd():
+    """The Run-key command: this install's windowless Python starting the
+    session, with the package's own directory on sys.path."""
+    root = str(paths.PKG.parent)
+    code = f"import sys;sys.path.insert(0,{root!r});import topopaper.session as s;s.main([])"
+    return f'"{system.gui_python()}" -c "{code}"'
+
+
+def _run_key(value=None, delete=False):
+    """Read (default), set or delete our value under HKCU\\...\\Run."""
+    import winreg
+    with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY, 0,
+                        winreg.KEY_READ | winreg.KEY_SET_VALUE) as k:
+        if delete:
+            try:
+                winreg.DeleteValue(k, "topopaper")
+                return True
+            except FileNotFoundError:
+                return False
+        if value is not None:
+            winreg.SetValueEx(k, "topopaper", 0, winreg.REG_SZ, value)
+            return value
+        try:
+            return winreg.QueryValueEx(k, "topopaper")[0]
+        except FileNotFoundError:
+            return ""
+
+
+def _native_status(comp):
+    if comp == "windows":
+        v = _run_key()
+        return {"enabled": bool(v), "method": "registry-run",
+                "detail": f"HKCU\\{RUN_KEY}\\topopaper" if v else "not set up"}
+    on = launch_agent().exists()
+    return {"enabled": on, "method": "launch-agent",
+            "detail": str(launch_agent()) if on else "not set up"}
+
+
+def _native_enable(comp):
+    if comp == "windows":
+        _run_key(windows_session_cmd())
+        return True, "topopaper will start when you sign in to Windows"
+    import plistlib
+    agent = {"Label": APP_ID, "ProgramArguments": [launcher("topopaper-session")],
+             "RunAtLoad": True, "LimitLoadToSessionType": "Aqua", "ProcessType": "Interactive"}
+    launch_agent().parent.mkdir(parents=True, exist_ok=True)
+    rewrite(launch_agent(), plistlib.dumps(agent).decode())
+    return True, f"topopaper will start when you log in ({launch_agent()})"
+
+
+def _native_disable(comp):
+    if comp == "windows":
+        gone = _run_key(delete=True)
+        return True, "removed the sign-in entry" if gone else "autostart was not set up"
+    if launch_agent().exists():
+        launch_agent().unlink()
+        return True, f"removed {launch_agent()}"
+    return True, "autostart was not set up"
+
+
+MAC_KEYS_HOWTO = ("macOS: open Shortcuts, make a shortcut with a \"Run Shell Script\" action "
+                  "running `{cmd} search`, then give it a keyboard shortcut in its details.")
+
+
+def _hotkey_status():
+    keys = config.load().get("search_hotkey").strip()
+    return {"enabled": bool(keys), "supported": True, "line": keys,
+            "detail": f"{keys}, held by the running wallpaper" if keys else "not set up"}
+
+
+def _hotkey_set(keys):
+    cfg = config.load()
+    cfg.set("search_hotkey", keys)
+    cfg.save()
+
+
 # ---- autostart --------------------------------------------------------------------------
 def _desktop_entry(exe):
     return ("[Desktop Entry]\nType=Application\nName=topopaper\n"
@@ -353,6 +441,9 @@ def own_autostart(comp=None):
 
 def status():
     """{'enabled': bool, 'method': str, 'detail': str} for this desktop."""
+    comp = compositor()
+    if comp in ("windows", "macos"):
+        return _native_status(comp)
     st = _managed_status()
     if not st["enabled"]:
         own = own_autostart()
@@ -391,6 +482,8 @@ def enable():
     exe = launcher("topopaper-session")
     tag = "topopaper"
     try:
+        if comp in ("windows", "macos"):
+            return _native_enable(comp)
         if comp == "kde":
             rewrite(desktop_file(), _desktop_entry(exe))
             return True, f"added {desktop_file()}"
@@ -424,6 +517,12 @@ def disable():
     """Undo enable() for every method (a desktop switch leaves no strays)."""
     tag = "topopaper"
     done = []
+    comp = compositor()
+    if comp in ("windows", "macos"):
+        try:
+            return _native_disable(comp)
+        except OSError as e:
+            return False, f"could not remove autostart: {e}"
     try:
         if desktop_file().exists():
             desktop_file().unlink()
@@ -558,6 +657,8 @@ KDE_HOWTO = ("Plasma keeps custom shortcuts in its own settings: open System Set
 def keybind_status():
     comp = compositor()
     tag = "topopaper keybind"
+    if comp == "windows":
+        return _hotkey_status()
     if comp == "sway":
         where = _sway_has(tag, "topopaper-keys.conf")
     elif comp == "hyprland":
@@ -565,9 +666,10 @@ def keybind_status():
     elif comp == "niri":
         where = str(niri_config()) if has_block(read(niri_config()), tag, "//") else ""
     else:
-        return {"enabled": False, "supported": False, "detail":
-                KDE_HOWTO.format(cmd=launcher("topopaper-ctl"), keys=DEFAULT_KEYS)
-                if comp == "kde" else "set a shortcut for `topopaper-ctl search` in your desktop's settings"}
+        how = {"kde": KDE_HOWTO.format(cmd=launcher("topopaper-ctl"), keys=DEFAULT_KEYS),
+               "macos": MAC_KEYS_HOWTO.format(cmd=launcher("topopaper-ctl"))}
+        return {"enabled": False, "supported": False, "detail": how.get(
+            comp, "set a shortcut for `topopaper-ctl search` in your desktop's settings")}
     keys = ""
     for ln in read(Path(where)).splitlines() if where else []:
         if "search" in ln and not ln.strip().startswith(("#", "//")):
@@ -587,6 +689,13 @@ def keybind_add(keys=DEFAULT_KEYS):
     tag = "topopaper keybind"
     try:
         mods, key = parse_keys(keys)
+        if comp == "windows":
+            from . import hotkey
+            hotkey.combo(keys)                       # ValueError for keys it can't register
+            _hotkey_set(keys)
+            return True, f"{keys} opens the place search while the wallpaper runs"
+        if comp == "macos":
+            return False, MAC_KEYS_HOWTO.format(cmd=ctl)
         if comp in ("sway", "hyprland"):
             want = _norm_combo(mods + [key])
             for combo, f, ln in existing_binds(comp):
@@ -628,6 +737,10 @@ def keybind_add(keys=DEFAULT_KEYS):
 def keybind_remove():
     tag = "topopaper keybind"
     done = []
+    if compositor() == "windows":
+        on = _hotkey_status()["enabled"]
+        _hotkey_set("")
+        return True, "removed the search shortcut" if on else "no keybinding was set"
     try:
         if _sway_remove(tag, "topopaper-keys.conf"):
             done.append("sway config")

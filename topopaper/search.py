@@ -1,15 +1,16 @@
 """`topopaper-ctl search`: fly the atlas anywhere.
 
-A launcher menu (rofi, fuzzel, wofi or tofi in dmenu mode) lists the
-installed packs (● marks the one on screen). Pick one to fly there; type any
-place on Earth and a pack is geocoded, built in the background, routed into
-the atlas, and flown to when it lands.
+A launcher menu (rofi, fuzzel, wofi or tofi in dmenu mode; on Windows and
+macOS topopaper's own search window) lists the installed packs (● marks the
+one on screen). Pick one to fly there; type any place on Earth and a pack is
+geocoded, built in the background, routed into the atlas, and flown to when
+it lands.
 """
 import shutil
 import subprocess
 import sys
 
-from . import config, geocode, jobs, util
+from . import config, geocode, jobs, system, util
 
 MENUS = {
     "rofi": ["rofi", "-dmenu", "-i", "-p", "atlas",
@@ -21,11 +22,23 @@ MENUS = {
 
 
 def pick_launcher(pref):
+    """A dmenu-style menu, 'window' (the Tk search box), or None (the
+    settings window's Places page)."""
     if pref in MENUS and shutil.which(pref):
         return pref
-    if pref == "settings":
-        return None
+    if pref in ("settings", "window"):
+        return pref if pref == "window" and has_window() else None
+    if not system.LINUX:
+        return "window" if has_window() else None
     return next((m for m in MENUS if shutil.which(m)), None)
+
+
+def has_window():
+    try:
+        import tkinter  # noqa: F401
+        return True
+    except ImportError:
+        return False
 
 
 def menu(choices, launcher):
@@ -83,6 +96,9 @@ def main(argv=None):
             # no dmenu-style launcher: the settings window has a search page
             from . import cli
             return cli.open_settings("places")
+        if launcher == "window":
+            from .tkui import picker
+            return picker.main([])
         cur = util.current_area()
         names = [f"{n} ●" if n == cur else n
                  for n, m in util.list_packs()
