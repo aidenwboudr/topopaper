@@ -53,8 +53,8 @@ static const char *attach_mode = "";
 // 24H2: GL can't present into the layered child (DWM never shows it), but
 // GDI painting can, as the icons' own layered window does. So there the
 // frame is drawn by GL as usual, read back and painted with GDI.
-// TOPA_WIN_PRESENT=swap|gdi overrides.
-static int present_gdi = 0;
+// TOPA_WIN_PRESENT=swap|gdi|ulw overrides (ulw: UpdateLayeredWindow).
+static int present_gdi = 0, present_ulw = 0;
 static unsigned char *gdi_px = NULL;
 static size_t gdi_cap = 0;
 static UINT   msg_taskbar = 0;
@@ -243,9 +243,10 @@ static void gl_load(void) {
 // (Re)attach to the desktop and make one window per selected monitor.
 static void build_views(void) {
     destroy_views();
-    int desk = attach_desktop();
+    int desk = strcmp(attach_mode, "none") ? attach_desktop() : 0;
     const char *pm = getenv("TOPA_WIN_PRESENT");
-    present_gdi = pm ? !strcmp(pm, "gdi") : (desk && layered);
+    present_ulw = pm && !strcmp(pm, "ulw");
+    present_gdi = pm ? (present_ulw || !strcmp(pm, "gdi")) : (desk && layered);
     EnumDisplayMonitors(NULL, NULL, add_monitor, 0);
     HINSTANCE inst = GetModuleHandleW(NULL);
     for (int i = 0; i < n_views; i++) {
@@ -257,7 +258,7 @@ static void build_views(void) {
             hw = CreateWindowExW(layered ? WS_EX_LAYERED : 0, VIEW_CLASS, L"topopaper",
                                  WS_POPUP, 0, 0, v->w, v->h, NULL, NULL, inst, NULL);
             if (hw) {
-                if (layered) SetLayeredWindowAttributes(hw, 0, 255, LWA_ALPHA);
+                if (layered && !present_ulw) SetLayeredWindowAttributes(hw, 0, 255, LWA_ALPHA);
                 SetWindowLongPtrW(hw, GWL_STYLE, WS_CHILD | WS_CLIPSIBLINGS | WS_CLIPCHILDREN);
                 if (!SetParent(hw, parent)) {
                     fprintf(stderr, "topopaper: SetParent failed (%lu); retrying\n", GetLastError());
@@ -298,7 +299,7 @@ static void build_views(void) {
         ShowWindow(hw, SW_SHOWNOACTIVATE);
         fprintf(stderr, "topopaper: drawing on %s (%dx%d%s%s%s%s)\n", v->name, v->w, v->h,
                 desk ? (raised ? ", desktop layer 24H2" : ", desktop layer") : ", bottom window",
-                present_gdi ? ", GDI present" : "", attach_mode[0] ? ", attach " : "", attach_mode);
+                present_ulw ? ", ULW present" : present_gdi ? ", GDI present" : "", attach_mode[0] ? ", attach " : "", attach_mode);
     }
     if (desk) dump_tree(FindWindowW(L"Progman", NULL), 0);
 }
@@ -386,7 +387,27 @@ static void present_frame(struct view *v) {
     bi.bmiHeader.biPlanes = 1;
     bi.bmiHeader.biBitCount = 32;
     bi.bmiHeader.biCompression = BI_RGB;
-    SetDIBitsToDevice(v->dc, 0, 0, v->w, v->h, 0, 0, 0, v->h, gdi_px, &bi, DIB_RGB_COLORS);
+    if (!present_ulw) {
+        SetDIBitsToDevice(v->dc, 0, 0, v->w, v->h, 0, 0, 0, v->h, gdi_px, &bi, DIB_RGB_COLORS);
+        return;
+    }
+    void *bits = NULL;
+    HDC mem = CreateCompatibleDC(v->dc);
+    HBITMAP bmp = CreateDIBSection(mem, &bi, DIB_RGB_COLORS, &bits, NULL, 0);
+    if (bmp && bits) {
+        memcpy(bits, gdi_px, need);
+        HGDIOBJ old = SelectObject(mem, bmp);
+        SIZE sz = { v->w, v->h };
+        POINT src = { 0, 0 };
+        BLENDFUNCTION bf = { AC_SRC_OVER, 0, 255, 0 };
+        if (!UpdateLayeredWindow(v->hwnd, NULL, NULL, &sz, mem, &src, 0, &bf, ULW_OPAQUE)) {
+            static int warned = 0;
+            if (!warned++) fprintf(stderr, "topopaper: UpdateLayeredWindow failed (%lu)\n", GetLastError());
+        }
+        SelectObject(mem, old);
+    }
+    if (bmp) DeleteObject(bmp);
+    DeleteDC(mem);
 }
 
 static void frame(void) {

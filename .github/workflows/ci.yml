@@ -141,14 +141,15 @@ jobs:
           Add-Type -AssemblyName System.Windows.Forms, System.Drawing
           $exe = "$env:LOCALAPPDATA\Programs\topopaper\bin\topopaper.exe"
           $py = "$env:LOCALAPPDATA\topopaper\venv\Scripts\python.exe"
-          foreach ($v in "progman/gdi", "progman/swap", "worker-layered/gdi", "worker/swap") {
+          foreach ($v in "progman/ulw", "progman/gdi", "worker-layered/ulw", "none/swap") {
             $m = $v.Replace("/", "-")
             $env:TOPA_WIN_ATTACH, $env:TOPA_WIN_PRESENT = $v.Split("/"); $env:TOPA_WIN_DEBUG = "1"
             $p = Start-Process $exe -PassThru -RedirectStandardError "shots\attach-$m.log"
             Start-Sleep 10
             $b = [System.Windows.Forms.SystemInformation]::VirtualScreen
             $bmp = New-Object System.Drawing.Bitmap $b.Width, $b.Height
-            [System.Drawing.Graphics]::FromImage($bmp).CopyFromScreen($b.Left, $b.Top, 0, 0, $bmp.Size)
+            [System.Drawing.Graphics]::FromImage($bmp).CopyFromScreen($b.Left, $b.Top, 0, 0, $bmp.Size,
+                [System.Drawing.CopyPixelOperation]::SourceCopy -bor [System.Drawing.CopyPixelOperation]::CaptureBlt)
             $bmp.Save("$pwd\shots\attach-$m.png")
             & $py -c "from topopaper import system; system.close_engine_windows()"
             if (-not $p.WaitForExit(10000)) { $p.Kill() }
