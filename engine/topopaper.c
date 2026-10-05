@@ -131,7 +131,10 @@ static GLuint prog, vbo;
 static GLint a_pos;
 static GLint u_res, u_crawlm, u_cpu, u_night, u_w;
 static GLint u_fam;
-static GLint u_dbg = -1;
+static GLint u_dbg = -1, u_hs = -1, u_fg = -1, u_fin = -1, u_sib = -1;
+static float g_fg[4] = {1.0f, 0.0f, 0.0f, 0.0f};   // feature gates per slot
+static float g_fin[16];                             // [i*4+j]: slot j finer than i
+static float g_sib[16];                             // [i*4+j]: slots i, j share a scale
 static GLint u_radpx, u_globec, u_wrap, u_sun, u_sunh, u_snow, u_aur;
 // city lights (lights.bin: world cities for the globe's night side)
 #define MAXLTS 8192
@@ -376,9 +379,9 @@ static void cfg_poll(int force) {
 // fNNNNN.ppm with a matching camera/weights line in <dir>/trace.txt, and
 // TOPA_REC_FLY=a,b,... flies to each pack in turn (TOPA_REC_HOLD seconds,
 // default 1, after start and after each landing settles), then quits.
-// TOPA_REC_DBG=N: every Nth frame also dumps dNNNNN_1.ppm (each pixel's
-// slot 0-2 shares as rgb, magenta where nothing covers) and dNNNNN_2..5.ppm
-// (slot 0, 1, 2, 3 rendered alone).
+// TOPA_REC_DBG=N: every Nth frame also dumps gNNNNN.ppm (the map before the
+// labels), dNNNNN_1.ppm (each pixel's slot 0-2 shares as rgb, magenta where
+// nothing covers) and dNNNNN_2..5.ppm (slot 0, 1, 2, 3 rendered alone).
 static int    g_rec = 0, rec_frame_n = 0, rec_was_flying = 0, rec_dbg = 0;
 static double rec_t = 0.0, rec_dt = 1.0 / 30.0, rec_hold = 1.0, rec_next = 0.0;
 static char   rec_dir[400], rec_fly[512];
@@ -1337,7 +1340,14 @@ static const char *FRAG =
     "uniform vec3 uBgLo, uBgHi, uLnLo, uLnHi, uWatC, uShoreC, uSnowC, uWarmC;\n"
     "uniform vec3 uRimC, uIceC, uAurA, uAurB;\n"
     "uniform vec4 uWrap;\n"                  // per-slot: 1 = full-world pack, wrap u
-    "uniform float uDbg;\n"                  // TOPA_REC_DBG: 1 slot shares, 2-4 slot 0-2 alone
+    "uniform float uDbg;\n"
+    // shared shading scale of this frame's blend (see shade_common): relief
+    // baseline (mercator units), relief gain per metre, line-colour ramp
+    // floor + span (metres)
+    "uniform vec4 uHs;\n"
+    "uniform vec4 uFG;\n"                    // per-slot feature gate (see feat_gates)
+    "uniform mat4 uFin;\n"                   // uFin[i][j] = 1: slot j is finer than slot i
+    "uniform mat4 uSib;\n"                   // uSib[i][j] = 1: slots i, j share a scale                  // TOPA_REC_DBG: 1 slot shares, 2-4 slot 0-2 alone
     "uniform sampler2D uTer0, uFW0, uTer1, uFW1, uTer2, uFW2, uTer3, uFW3;\n"
     "uniform vec2 uTexel0, uTC0, uTS0;\n"
     "uniform vec2 uTexel1, uTC1, uTS1;\n"
@@ -1425,9 +1435,11 @@ static const char *FRAG =
     "  float l=1.0-smoothstep(w, w+g, d);\n"
     "  return l*(1.0-smoothstep(0.18, 0.42, g)); }\n"
     // ---- full real-terrain colour for one slot (uv-space core) -------------
+    // terrain colour of one slot; its feature alphas (roads/runs, lifts/
+    // borders) come back in fa for the shared feature layer
     "vec3 slotRealUV(vec2 uv, sampler2D ter, sampler2D fw,\n"
-    "                vec2 texel, vec4 ctr,\n"
-    "                vec3 fcL, vec3 fpL, vec3 fcA, vec3 fpA){\n"
+    "                vec2 texel, vec2 ts, vec4 ctr,\n"
+    "                vec3 fpL, vec3 fpA, out vec2 fa){\n"
     "  float h=terBic(ter, texel, uv);\n"
     "  float hm=ctr.x+h*ctr.y+uCrawlM;\n"    // absolute metres + global crawl
     // FRACTAL FAMILIES: fine=s fades with band phase t; mid=5s morphs
@@ -1452,16 +1464,25 @@ static const char *FRAG =
     "  minor*=land; major*=land;\n"
     "  vec2 suvy=gl_FragCoord.xy/uRes.xy;\n"
     "  vec3 base=mix(uBgLo, uBgHi, suvy.y);\n"
-    "  vec2 gx=vec2(texel.x*2.4, 0.0);\n"
-    "  vec2 gy=vec2(0.0, texel.y*2.4);\n"
+    // relief: every slot measures the slope over the SAME ground baseline
+    // and shades it with the same gain, so overlapping packs agree (each
+    // pack's own texel-and-range scaling made a pack's rectangle read
+    // brighter or flatter than its neighbour). At rest that common scale is
+    // the pack's own: 4.8 of its texels, 80 per elevation range. A coarse
+    // pack never samples finer than its own 4.8 texels (bilinear facets);
+    // its slope is rescaled to the common baseline instead.
+    "  float bl=max(uHs.x, 4.8*texel.y/(6.28318531*ts.y));\n"
+    "  vec2 o=bl*3.14159265*ts;\n"
+    "  vec2 gx=vec2(o.x, 0.0);\n"
+    "  vec2 gy=vec2(0.0, o.y);\n"
     "  vec2 g2=vec2(terBil(ter,texel,uv+gx)-terBil(ter,texel,uv-gx),\n"
-    "               terBil(ter,texel,uv+gy)-terBil(ter,texel,uv-gy));\n"
-    "  vec3 nrm=normalize(vec3(-g2.x*80.0, -g2.y*80.0, 1.0));\n"
+    "               terBil(ter,texel,uv+gy)-terBil(ter,texel,uv-gy))*ctr.y*uHs.y*(uHs.x/bl);\n"
+    "  vec3 nrm=normalize(vec3(-g2.x, -g2.y, 1.0));\n"
     "  float sh=clamp(dot(nrm, normalize(uSunH.xyz)), 0.0, 1.0);\n"
     "  base*=mix(1.0, 0.64+0.68*sh, 0.50);\n"
     "  base=mix(base, base*vec3(1.26,1.02,0.84), uSunH.w*sh*0.50);\n"
     "  float lineOp=0.75;\n"
-    "  vec3 lc=mix(uLnLo, uLnHi, clamp(h*0.85,0.0,1.0));\n"
+    "  vec3 lc=mix(uLnLo, uLnHi, clamp((hm-uCrawlM-uHs.z)/uHs.w*0.85,0.0,1.0));\n"
     "  vec3 col=mix(base, lc, minor*0.45*lineOp);\n"
     "  col=mix(col, lc*1.22, major*0.60*lineOp);\n"
     "  vec3 wcol=mix(base, uWatC, 0.62);\n"
@@ -1473,15 +1494,13 @@ static const char *FRAG =
     // crawl removed); roads/labels draw after, so passes stay plowed
     "  float sn=smoothstep(uSnow, uSnow+140.0, hm-uCrawlM)*land;\n"
     "  col=mix(col, uSnowC, sn*0.42);\n"
+    "  float line=max(minor, major);\n"
+    "  col=mix(col, uWarmC, line*uCpu*0.28);\n"
     "  vec2 rdt=texture2D(fw, uv).rg;\n"
     "  float dL=rdt.x*31.875*ctr.w;\n"
     "  float dA=rdt.y*31.875*ctr.w;\n"
-    "  float sL=1.0-smoothstep(fpL.x, fpL.y, dL);\n"
-    "  float sA=1.0-smoothstep(fpA.x, fpA.y, dA);\n"
-    "  col=mix(col, fcL, sL*fpL.z);\n"
-    "  col=mix(col, fcA, sA*fpA.z);\n"
-    "  float line=max(minor, major);\n"
-    "  col=mix(col, uWarmC, line*uCpu*0.28);\n"
+    "  fa=vec2((1.0-smoothstep(fpL.x, fpL.y, dL))*fpL.z,\n"
+    "          (1.0-smoothstep(fpA.x, fpA.y, dA))*fpA.z);\n"
     "  return col; }\n"
     "void main(){\n"
     "  vec2 suv=gl_FragCoord.xy/uRes.xy;\n"
@@ -1522,8 +1541,10 @@ static const char *FRAG =
     "    if(uWrap.x>0.5) cl0.x=uv0.x;\n"
     "    vec2 cvv0=uv0; if(uWrap.x>0.5) cvv0.x=0.5;\n"
     "    float cov0=slotCov(cvv0, uTexel0);\n"
-    "    vec3 c0=slotRealUV(cl0, uTer0, uFW0, uTexel0, uCtr0,\n"
-    "                       uFcL0, uFpL0, uFcA0, uFpA0);\n"
+    "    vec2 fa0, fa1=vec2(0.0), fa2=vec2(0.0), fa3=vec2(0.0);\n"
+    "    float cov1=0.0, cov2=0.0, cov3=0.0;\n"
+    "    vec3 c0=slotRealUV(cl0, uTer0, uFW0, uTexel0, uTS0, uCtr0,\n"
+    "                       uFpL0, uFpA0, fa0);\n"
     "    float w0v=uW.x*cov0;\n"
     "    float w1v=0.0; vec3 c1=vec3(0.0);\n"
     "    if (uW.y > 0.001) {\n"
@@ -1531,9 +1552,9 @@ static const char *FRAG =
     "      vec2 cl1=clamp(uv1, uTexel1*2.5, 1.0-uTexel1*2.5);\n"
     "      if(uWrap.y>0.5) cl1.x=uv1.x;\n"
     "      vec2 cvv1=uv1; if(uWrap.y>0.5) cvv1.x=0.5;\n"
-    "      float cov1=slotCov(cvv1, uTexel1);\n"
-    "      c1=slotRealUV(cl1, uTer1, uFW1, uTexel1, uCtr1,\n"
-    "                    uFcL1, uFpL1, uFcA1, uFpA1);\n"
+    "      cov1=slotCov(cvv1, uTexel1);\n"
+    "      c1=slotRealUV(cl1, uTer1, uFW1, uTexel1, uTS1, uCtr1,\n"
+    "                    uFpL1, uFpA1, fa1);\n"
     "      w1v=uW.y*cov1;\n"
     "    }\n"
     "    float w2v=0.0; vec3 c2=vec3(0.0);\n"
@@ -1542,9 +1563,9 @@ static const char *FRAG =
     "      vec2 cl2=clamp(uv2, uTexel2*2.5, 1.0-uTexel2*2.5);\n"
     "      if(uWrap.z>0.5) cl2.x=uv2.x;\n"
     "      vec2 cvv2=uv2; if(uWrap.z>0.5) cvv2.x=0.5;\n"
-    "      float cov2=slotCov(cvv2, uTexel2);\n"
-    "      c2=slotRealUV(cl2, uTer2, uFW2, uTexel2, uCtr2,\n"
-    "                    uFcL2, uFpL2, uFcA2, uFpA2);\n"
+    "      cov2=slotCov(cvv2, uTexel2);\n"
+    "      c2=slotRealUV(cl2, uTer2, uFW2, uTexel2, uTS2, uCtr2,\n"
+    "                    uFpL2, uFpA2, fa2);\n"
     "      w2v=uW.z*cov2;\n"
     "    }\n"
     // slot 3: the coverage container at a token weight (it only shows
@@ -1555,9 +1576,9 @@ static const char *FRAG =
     "      vec2 cl3=clamp(uv3, uTexel3*2.5, 1.0-uTexel3*2.5);\n"
     "      if(uWrap.w>0.5) cl3.x=uv3.x;\n"
     "      vec2 cvv3=uv3; if(uWrap.w>0.5) cvv3.x=0.5;\n"
-    "      float cov3=slotCov(cvv3, uTexel3);\n"
-    "      c3=slotRealUV(cl3, uTer3, uFW3, uTexel3, uCtr3,\n"
-    "                    uFcL3, uFpL3, uFcA3, uFpA3);\n"
+    "      cov3=slotCov(cvv3, uTexel3);\n"
+    "      c3=slotRealUV(cl3, uTer3, uFW3, uTexel3, uTS3, uCtr3,\n"
+    "                    uFpL3, uFpA3, fa3);\n"
     "      w3v=uW.w*cov3;\n"
     "    }\n"
     "    float tot=w0v+w1v+w2v+w3v;\n"
@@ -1566,6 +1587,31 @@ static const char *FRAG =
     "                        :uDbg<2.5?c0:uDbg<3.5?c1:uDbg<4.5?c2:c3, 1.0);\n"
     "      return; }\n"
     "    vec3 terr=(tot>1e-4)?(c0*w0v+c1*w1v+c2*w2v+c3*w3v)/tot:bg;\n"
+    // FEATURE LAYER: roads, runs, lifts and borders composite on top of the
+    // blended terrain instead of riding each slot's share, so a pack's road
+    // network never shows as a faint rectangle while it covers only part of
+    // the view. Each slot inks at its gate (uFG: on once its scale covers
+    // most of the view, fading with its weight), and a finer slot's inked
+    // area takes over from coarser slots (the same roads, sharper), so
+    // shared roads keep one strength across the hand-off.
+    // same-scale siblings split their overlap by share (two ski areas
+    // whose boxes overlap must not both ink the shared runs)
+    "    vec4 wc=vec4(w0v, w1v, w2v, w3v);\n"
+    "    vec4 sib=vec4(wc.x/max(dot(uSib[0],wc),1e-6), wc.y/max(dot(uSib[1],wc),1e-6),\n"
+    "                  wc.z/max(dot(uSib[2],wc),1e-6), wc.w/max(dot(uSib[3],wc),1e-6));\n"
+    "    vec4 gc=uFG*vec4(cov0, cov1, cov2, cov3);\n"
+    "    vec4 sup=vec4(1.0);\n"
+    "    for(int i=0;i<4;i++){\n"
+    "      vec4 f=uFin[i];\n"
+    "      float v=(1.0-f.x*gc.x)*(1.0-f.y*gc.y)*(1.0-f.z*gc.z)*(1.0-f.w*gc.w);\n"
+    "      if(i==0) sup.x=v; else if(i==1) sup.y=v; else if(i==2) sup.z=v; else sup.w=v;\n"
+    "    }\n"
+    "    vec4 ka=gc*sup*sib;\n"
+    "    vec4 aL=ka*vec4(fa0.x, fa1.x, fa2.x, fa3.x);\n"
+    "    vec4 aA=ka*vec4(fa0.y, fa1.y, fa2.y, fa3.y);\n"
+    "    float tL=dot(aL, vec4(1.0)), tA=dot(aA, vec4(1.0));\n"
+    "    if(tL>1e-4) terr=mix(terr, (uFcL0*aL.x+uFcL1*aL.y+uFcL2*aL.z+uFcL3*aL.w)/tL, min(tL,1.0));\n"
+    "    if(tA>1e-4) terr=mix(terr, (uFcA0*aA.x+uFcA1*aA.y+uFcA2*aA.z+uFcA3*aA.w)/tA, min(tA,1.0));\n"
     "    terr*=0.72+0.28*z;\n"          // limb darkening; ==1.0 up close
     // dusk band: warm cast where the sun grazes the terminator's day side
     "    float band=1.0-smoothstep(0.0, 0.26, abs(sdot-0.02));\n"
@@ -1720,6 +1766,10 @@ void engine_gl_init(void) {
     u_fam     = glGetUniformLocation(prog, "uFam");
     u_radpx   = glGetUniformLocation(prog, "uRadPx");
     u_dbg     = glGetUniformLocation(prog, "uDbg");
+    u_hs      = glGetUniformLocation(prog, "uHs");
+    u_fg      = glGetUniformLocation(prog, "uFG");
+    u_fin     = glGetUniformLocation(prog, "uFin");
+    u_sib     = glGetUniformLocation(prog, "uSib");
     u_globec  = glGetUniformLocation(prog, "uGlobeC");
     u_sun     = glGetUniformLocation(prog, "uSun");
     u_sunh    = glGetUniformLocation(prog, "uSunH");
@@ -2180,6 +2230,43 @@ static void step_world(void) {
     if (gg >= 0 && !ensure_pack_gl(gg)) { gg = -1; w2v = 0.0; }
     s_slotpk[0] = a; s_slotpk[1] = b; s_slotpk[2] = gg; s_slotpk[3] = cont;
     g_w0v = (float)w0v; g_w1v = (float)w1v; g_w2v = (float)w2v; g_w3v = (float)w3v;
+    // FEATURE GATES (shader feature layer): a slot's roads/lifts/borders ink
+    // once its scale group covers most of the view (fine-only roads never
+    // show as a rectangle) and fade with its weight (nothing inks as it
+    // leaves the slots). uFin orders the slots by scale for the hand-over.
+    {
+        double wvs[4] = { w0v, b != a ? w1v : 0.0, w2v, w3v };
+        for (int i = 0; i < 4; i++) {
+            int pi = s_slotpk[i];
+            g_fg[i] = 0.0f;
+            for (int j = 0; j < 4; j++) g_fin[i * 4 + j] = g_sib[i * 4 + j] = 0.0f;
+            g_sib[i * 4 + i] = 1.0f;
+            if (pi < 0 || wvs[i] <= 0.0) continue;
+            double gm = packs[pi].msy, uni = 0.0;
+            int gk_[MAXSIB], ng = 0;
+            for (int k = 0; k < n_lad && ng < MAXSIB; k++) {
+                double m = packs[lad[k]].msy;
+                if (m > gm / 1.05 && m < gm * 1.05 && ovl[k] > 0.0) gk_[ng++] = k;
+            }
+            for (int x = 0; x < ng; x++) {
+                uni += ovl[gk_[x]];
+                for (int y = x + 1; y < ng; y++)
+                    uni -= rect_ovl3(&packs[lad[gk_[x]]], &packs[lad[gk_[y]]],
+                                     vx0, vy0, vx1, vy1, varea);
+            }
+            if (packs[pi].msx > 0.999) uni = 1.0;
+            g_fg[i] = (float)(smooth01((uni - 0.6) / 0.35) * smooth01(wvs[i] / 0.15));
+            for (int j = 0; j < 4; j++) {
+                int pj = s_slotpk[j];
+                if (j != i && pj >= 0 && pj != pi && packs[pj].msy < gm * 0.95)
+                    g_fin[i * 4 + j] = 1.0f;
+                if (j != i && pj >= 0 && packs[pj].msy > gm / 1.05 && packs[pj].msy < gm * 1.05)
+                    g_sib[i * 4 + j] = 1.0f;
+            }
+        }
+        for (int i = 0; i < 4; i++)              // a pack doubled into two slots inks once
+            for (int j = 0; j < i; j++) if (s_slotpk[j] == s_slotpk[i]) g_fg[i] = 0.0f;
+    }
     for (int j = 0; j < 3; j++) g_lf[j] = ord[j] >= 0 ? (float)wlf[ord[j]] : 1.0f;
     {   // TOPA_DEBUG=1: per-frame camera/slot trace for jump hunting
         static int dbg = -1;
@@ -2426,6 +2513,30 @@ static void hud_line(float xf, float base, int w, int h) {
         }
         x -= gw + trk;
     }
+}
+
+// One shading scale for every slot of this frame's blend: the relief
+// baseline (4.8 texels, in mercator units), the relief gain (80 per metre
+// of the elevation range) and the contour-colour ramp (elevation floor and
+// range), each the weight-blend of the slots' own. At rest that is exactly
+// the pack's own look; mid-flight all slots shade the same ground the same
+// way, so hand-off zones don't show as brighter or flatter rectangles.
+static void shade_common(void) {
+    float wv[3] = { g_w0v, g_w1v, g_w2v };
+    double sw = 0.0, b = 0.0, gn = 0.0, lo = 0.0, rg = 0.0;
+    for (int i = 0; i < 3; i++) {
+        struct pack *p = s_slotpk[i] >= 0 ? &packs[s_slotpk[i]] : NULL;
+        if (!p || !p->gl_ok || wv[i] <= 0.0f) continue;
+        double r = p->elev_hi - p->elev_lo;
+        if (r < 1.0) r = 1.0;
+        b  += wv[i] * 4.8 * p->msy / (double)p->ter_h;
+        gn += wv[i] * 80.0 / r;
+        lo += wv[i] * p->elev_lo;
+        rg += wv[i] * r;
+        sw += wv[i];
+    }
+    if (sw <= 0.0) { glUniform4f(u_hs, 1e-3f, 0.01f, 0.0f, 4000.0f); return; }
+    glUniform4f(u_hs, (float)(b / sw), (float)(gn / sw), (float)(lo / sw), (float)(rg / sw));
 }
 
 // per-slot uniform + label-projection refresh for this frame
@@ -2717,6 +2828,10 @@ void engine_render(int w, int h, int primary) {
     glUniform1f(u_cpu, g_cpu);
     glUniform1f(u_night, g_night);
     glUniform4f(u_w, g_w0v, g_w1v, g_w2v, g_w3v);
+    shade_common();
+    glUniform4fv(u_fg, 1, g_fg);
+    glUniformMatrix4fv(u_fin, 1, GL_FALSE, g_fin);
+    glUniformMatrix4fv(u_sib, 1, GL_FALSE, g_sib);
     // ortho sphere radius: centre ground scale == old planar mapping exactly
     g_radpx = (double)h / (cam_h * 2.0 * M_PI * cos(g_glat));
     glUniform1f(u_radpx, (float)g_radpx);
@@ -2747,6 +2862,11 @@ void engine_render(int w, int h, int primary) {
     glEnableVertexAttribArray(a_pos);
     glVertexAttribPointer(a_pos, 2, GL_FLOAT, GL_FALSE, 0, 0);
     glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+    if (primary && g_rec && rec_dbg > 0 && rec_frame_n % rec_dbg == 0) {
+        char nm[32];                         // TOPA_REC_DBG: the map before labels
+        snprintf(nm, sizeof nm, "g%05d", rec_frame_n);
+        rec_capture(w, h, nm);
+    }
 
     // ---- labels: the ladder pair, weighted by the crossfade ----------------
     if (cam_init && cfg.labels) {

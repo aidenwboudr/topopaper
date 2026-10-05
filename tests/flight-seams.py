@@ -12,8 +12,14 @@ and the disagreement inside them can be measured directly:
          (the median of the neighbouring frames' change)
   voids  screen no slot covers (drawn as bare background), once the planet
          fills the frame
+  edges  in the map as drawn (g*, before labels): for every slotted pack's
+         bbox edge on screen,
+         the colour step between bands just inside and just outside it,
+         less the step between two bands on one side (scene variation) —
+         what a viewer sees as a rectangle (needs --data for the metas)
 
-    tests/flight-seams.py REC_DIR [--max-tone X] [--max-pop X] [--max-void X] [--maps]
+    tests/flight-seams.py REC_DIR [--data DIR] [--max-edge X] [--max-tone X]
+                          [--max-pop X] [--max-void X] [--maps]
 
 Exits 1 if a limit is exceeded. --maps writes seam-NNNNN.png overlays.
 """
@@ -52,7 +58,8 @@ def trace(rec):
         f = ln.split()
         m = re.search(r"slots=(\S+) w=", ln)
         slots = [(s.rsplit(":", 1)[0], float(s.rsplit(":", 1)[1])) for s in m.group(1).split(",")]
-        rows[int(f[0])] = dict(fly=int(f[1]), tau=float(f[2]), h=float(f[3]), slots=slots)
+        rows[int(f[0])] = dict(fly=int(f[1]), tau=float(f[2]), h=float(f[3]),
+                               x=float(f[4]), y=float(f[5]), slots=slots)
     return rows
 
 
@@ -90,6 +97,89 @@ def tone(rec, n, tr, maps):
     return worst, where, void
 
 
+def metas(data):
+    import struct
+    out = {}
+    for n in os.listdir(os.path.join(data, "areas")):
+        try:
+            b = open(os.path.join(data, "areas", n, "meta.bin"), "rb").read(40)
+            out[n] = struct.unpack("<4d", b[8:40])
+        except OSError:
+            pass
+    return out
+
+
+def project(mx, my, r, w, h):
+    """Mercator -> screen px (the engine's orthographic sphere)."""
+    cy = r["y"]
+    glat = np.clip(np.arctan(np.sinh(np.pi * (1 - 2 * cy))), -1.05, 1.05)
+    glon = (r["x"] - 0.5) * 2 * np.pi
+    R = h / (r["h"] * 2 * np.pi * np.cos(glat))
+    lon = (mx - 0.5) * 2 * np.pi
+    lat = np.arctan(np.sinh(np.pi * (1 - 2 * my)))
+    dl = lon - glon
+    cosc = np.sin(glat) * np.sin(lat) + np.cos(glat) * np.cos(lat) * np.cos(dl)
+    X = np.cos(lat) * np.sin(dl)
+    Y = np.cos(glat) * np.sin(lat) - np.sin(glat) * np.cos(lat) * np.cos(dl)
+    return w / 2 + X * R, h / 2 - Y * R, cosc
+
+
+def band(img, px, py, nx, ny, d0, d1):
+    """Mean colour over offsets [d0,d1] along the normal from edge points."""
+    h, w = img.shape[:2]
+    acc, cnt = np.zeros(3), 0
+    for d in range(d0, d1 + 1, 4):
+        x = np.round(px + nx * d).astype(int)
+        y = np.round(py + ny * d).astype(int)
+        ok = (x >= 0) & (x < w) & (y >= 0) & (y < h)
+        if ok.any():
+            acc += img[y[ok], x[ok]].sum(axis=0)
+            cnt += ok.sum()
+    return acc / max(cnt, 1)
+
+
+def edges(rec, tr, mt, n):
+    """Worst visible bbox-edge step in frame n's map (before the labels)."""
+    img = load(f"{rec}/g{n:05d}.ppm")
+    h, w = img.shape[:2]
+    r = tr[n]
+    worst, where = 0.0, None
+    for name, wt in r["slots"][:3]:
+        if name == "-" or wt < 0.002 or name not in mt:
+            continue
+        mx0, my0, msx, msy = mt[name]
+        if msx > 0.999:
+            continue
+        cx, cy = mx0 + msx / 2, my0 + msy / 2
+        t = np.linspace(0, 1, 160)
+        for ex, ey in ((mx0 + 0 * t, my0 + msy * t), (mx0 + msx + 0 * t, my0 + msy * t),
+                       (mx0 + msx * t, my0 + 0 * t), (mx0 + msx * t, my0 + msy + 0 * t)):
+            px, py, cc = project(ex, ey, r, w, h)
+            ix, iy, _ = project(ex + (cx - ex) * 1e-3, ey + (cy - ey) * 1e-3, r, w, h)
+            nx, ny = ix - px, iy - py
+            ln = np.hypot(nx, ny) + 1e-12
+            nx, ny = nx / ln, ny / ln
+            # every sample band of a point must lie on screen
+            m = cc > 0.3
+            for d in (-150, 240):
+                qx, qy = px + nx * d, py + ny * d
+                m &= (qx > 2) & (qx < w - 3) & (qy > 2) & (qy < h - 3)
+            m &= (px > 2) & (px < w - 3) & (py > 2) & (py < h - 3)
+            if m.sum() < 25:
+                continue
+            px, py, nx, ny = px[m], py[m], nx[m], ny[m]
+            # inside the bbox the coverage feather spans ~80px, so the
+            # inside band starts past it
+            o1, o2 = band(img, px, py, nx, ny, -60, -10), band(img, px, py, nx, ny, -150, -100)
+            i1, i2 = band(img, px, py, nx, ny, 90, 140), band(img, px, py, nx, ny, 190, 240)
+            step = np.abs(i1 - o1).max()
+            ctrl = max(np.abs(o2 - o1).max(), np.abs(i2 - i1).max())
+            v = step - ctrl
+            if v > worst:
+                worst, where = v, name
+    return worst, where
+
+
 def pops(rec, tr):
     fs = sorted(glob.glob(f"{rec}/f*.ppm"))
     prev, diffs = None, []
@@ -116,6 +206,8 @@ def main():
     ap.add_argument("--max-tone", type=float, default=None)
     ap.add_argument("--max-pop", type=float, default=None)
     ap.add_argument("--max-void", type=float, default=None)
+    ap.add_argument("--max-edge", type=float, default=None)
+    ap.add_argument("--data", default=None)
     ap.add_argument("--maps", action="store_true")
     a = ap.parse_args()
     tr = trace(a.rec)
@@ -132,18 +224,32 @@ def main():
             worst_t = (v, n, where)
         if vd > worst_v[0]:
             worst_v = (vd, n)
+    worst_e = (0.0, None, None)
+    if a.data:
+        mt = metas(a.data)
+        print("\nedge steps (map frames, 0-255, step minus scene variation):")
+        for n in dbg:
+            if n not in tr or tr[n]["h"] > 0.12:
+                continue
+            v, where = edges(a.rec, tr, mt, n)
+            if v > 2.0:
+                print(f"  {v:5.1f}  frame {n}  tau {tr[n]['tau']:.3f}  {where}")
+            if v > worst_e[0]:
+                worst_e = (v, n, where)
     pp = sorted(pops(a.rec, tr), reverse=True)[:8]
     print("\nlargest pops (tile excess over neighbour median, 0-255):")
     for v, n, k in pp:
         r = tr.get(n, {})
         print(f"  {v:5.1f}  frame {n}  tile {k}  tau {r.get('tau', 0):.3f}  "
               f"{' '.join(f'{s}:{w:.3f}' for s, w in r.get('slots', []))}")
-    print(f"\nworst tone {worst_t[0]:.1f} (frame {worst_t[1]}, {worst_t[2]}); "
+    print(f"\nworst edge {worst_e[0]:.1f} (frame {worst_e[1]}, {worst_e[2]}); "
+          f"worst tone {worst_t[0]:.1f} (frame {worst_t[1]}, {worst_t[2]}); "
           f"worst pop {pp[0][0] if pp else 0:.1f}; "
           f"worst void {worst_v[0]:.3f} (frame {worst_v[1]})")
     bad = (a.max_tone is not None and worst_t[0] > a.max_tone) or \
           (a.max_pop is not None and pp and pp[0][0] > a.max_pop) or \
-          (a.max_void is not None and worst_v[0] > a.max_void)
+          (a.max_void is not None and worst_v[0] > a.max_void) or \
+          (a.max_edge is not None and worst_e[0] > a.max_edge)
     sys.exit(1 if bad else 0)
 
 
