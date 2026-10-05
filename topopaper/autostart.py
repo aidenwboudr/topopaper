@@ -15,6 +15,7 @@ change. Every operation is idempotent and `disable`/`remove` take back
 exactly what `enable`/`add` wrote.
 """
 import fnmatch
+import glob
 import os
 import re
 import shutil
@@ -299,8 +300,52 @@ def _systemd_enabled():
         (unit_file().parent / "graphical-session.target.wants" / UNIT_NAME).exists()
 
 
+_START_LINE = re.compile(r"^\s*(exec(_always)?|exec-once|spawn-at-startup|Exec=)\b.*topopaper-session")
+
+
+def _config_files(comp):
+    """Config files a compositor reads at startup (main file + includes)."""
+    if comp == "sway":
+        files = [sway_config()]
+        for pat in sway_includes(sway_config()):
+            if pat.startswith(str(Path.home())):
+                files += [Path(f) for f in sorted(glob.glob(pat))]
+        return files
+    if comp == "hyprland":
+        files = [hypr_config()]
+        for ln in read(hypr_config()).splitlines():
+            m = re.match(r"\s*source\s*=\s*(.+?)\s*$", ln)
+            if m:
+                files += [Path(f) for f in sorted(glob.glob(_expand(m[1], str(hypr_config().parent))))]
+        return files
+    if comp == "niri":
+        return [niri_config()]
+    if comp == "kde":
+        return sorted(desktop_file().parent.glob("*.desktop"))
+    return []
+
+
+def own_autostart(comp=None):
+    """A start line the user wrote themselves (README's manual setup, or a
+    dotfiles repo): the path holding it, or ''."""
+    for f in _config_files(comp or compositor()):
+        if any(_START_LINE.match(ln) for ln in read(f).splitlines()):
+            return str(f)
+    return ""
+
+
 def status():
     """{'enabled': bool, 'method': str, 'detail': str} for this desktop."""
+    st = _managed_status()
+    if not st["enabled"]:
+        own = own_autostart()
+        if own:
+            return {"enabled": True, "method": "own-config",
+                    "detail": f"started by your own line in {own}", "managed": False}
+    return st
+
+
+def _managed_status():
     comp = compositor()
     tag = "topopaper"
     if comp == "kde":
@@ -383,6 +428,10 @@ def disable():
             done.append(str(unit_file()))
     except OSError as e:
         return False, f"could not remove autostart: {e}"
+    own = own_autostart()
+    if own:
+        return False, (f"topopaper is also started by your own line in {own} — "
+                       "remove that line to stop it starting at login")
     return True, ("removed autostart from " + ", ".join(done)) if done else "autostart was not set up"
 
 
