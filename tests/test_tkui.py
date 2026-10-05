@@ -309,6 +309,10 @@ def _display_or_skip():
     pytest.importorskip("tkinter")
     if sys.platform.startswith("linux") and not os.environ.get("DISPLAY"):
         pytest.skip("no $DISPLAY")
+    if sys.platform == "darwin":
+        # Tk on macOS aborts when a process makes a second Tk root after
+        # destroying one; CI opens the real window in its own process instead
+        pytest.skip("several Tk roots in one process abort on macOS")
     import tkinter
     try:
         r = tkinter.Tk()
