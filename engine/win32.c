@@ -48,19 +48,16 @@ static HWND   parent = NULL;        // WorkerW or Progman; NULL in fallback mode
 static HWND   below_icons = NULL;   // 24H2: SHELLDLL_DefView, we go right under it
 static int    raised = 0;           // 24H2 layout
 static int    layered = 0;          // our windows are WS_EX_LAYERED
-// TOPA_WIN_ATTACH (diagnostics): progman (24H2 default), worker, worker-layered, top
+// TOPA_WIN_ATTACH: "window" skips the desktop layer (plain bottom windows);
+// diagnostics: worker, worker-layered, top
 static const char *attach_mode = "";
-// "below" (24H2 experiment): top-level windows right under Progman, whose
-// wallpaper WorkerW is hidden so Progman (no surface of its own) shows them
-static HWND below = NULL;           // Progman, when sitting under it
-static HWND hidden_worker = NULL;   // the WorkerW we hid (shown again on exit)
-// 24H2: GL can't present into the layered child (DWM never shows it), but
-// GDI painting can, as the icons' own layered window does. So there the
-// frame is drawn by GL as usual, read back and painted with GDI.
-// TOPA_WIN_PRESENT=swap|gdi|ulw overrides (ulw: UpdateLayeredWindow).
-static int present_gdi = 0, present_ulw = 0;
-static unsigned char *gdi_px = NULL;
-static size_t gdi_cap = 0;
+// The desktop layer can accept our windows without DWM ever showing them
+// (seen on Windows Server 2025, reported on some 24H2/25H2 builds). A few
+// seconds after attaching, the screen is compared with our own frame; if
+// the desktop shows none of it, we fall back to plain bottom windows.
+static int    no_desktop = 0;       // proved invisible: stay in window mode
+static double vis_check_at = -1.0;  // engine_now() of the next check (<0: none)
+static int    vis_tries = 0;
 static UINT   msg_taskbar = 0;
 static int    rebuild = 1;
 static const wchar_t *VIEW_CLASS = L"topopaperView";
@@ -161,9 +158,9 @@ static LRESULT CALLBACK view_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
     case WM_ERASEBKGND: return 1;
     case WM_PAINT: ValidateRect(h, NULL); return 0;
     case WM_WINDOWPOSCHANGING:
-        if (!parent) {                                 // stay at the bottom / under Progman
+        if (!parent) {                                 // fallback: stay at the bottom
             WINDOWPOS *wp = (WINDOWPOS *)l;
-            wp->hwndInsertAfter = below ? below : HWND_BOTTOM;
+            wp->hwndInsertAfter = HWND_BOTTOM;
             wp->flags &= ~SWP_NOZORDER;
         }
         break;
@@ -247,20 +244,10 @@ static void gl_load(void) {
 // (Re)attach to the desktop and make one window per selected monitor.
 static void build_views(void) {
     destroy_views();
-    int desk = strcmp(attach_mode, "none") ? attach_desktop() : 0;
-    below = NULL;
-    if (desk && !strncmp(attach_mode, "below", 5)) {
-        below = FindWindowW(L"Progman", NULL);
-        if (!strcmp(attach_mode, "below-hide") && worker && IsWindowVisible(worker)) {
-            hidden_worker = worker;
-            ShowWindow(worker, SW_HIDE);
-        }
-        desk = 0;
-        parent = NULL;
-    }
-    const char *pm = getenv("TOPA_WIN_PRESENT");
-    present_ulw = pm && !strcmp(pm, "ulw");
-    present_gdi = pm ? (present_ulw || !strcmp(pm, "gdi")) : (desk && layered);
+    int desk = (no_desktop || !strcmp(attach_mode, "window")) ? 0 : attach_desktop();
+    if (!desk) parent = NULL;
+    vis_check_at = desk ? engine_now() + 4.0 : -1.0;
+    vis_tries = 0;
     EnumDisplayMonitors(NULL, NULL, add_monitor, 0);
     HINSTANCE inst = GetModuleHandleW(NULL);
     for (int i = 0; i < n_views; i++) {
@@ -272,7 +259,7 @@ static void build_views(void) {
             hw = CreateWindowExW(layered ? WS_EX_LAYERED : 0, VIEW_CLASS, L"topopaper",
                                  WS_POPUP, 0, 0, v->w, v->h, NULL, NULL, inst, NULL);
             if (hw) {
-                if (layered && !present_ulw) SetLayeredWindowAttributes(hw, 0, 255, LWA_ALPHA);
+                if (layered) SetLayeredWindowAttributes(hw, 0, 255, LWA_ALPHA);
                 SetWindowLongPtrW(hw, GWL_STYLE, WS_CHILD | WS_CLIPSIBLINGS | WS_CLIPCHILDREN);
                 if (!SetParent(hw, parent)) {
                     fprintf(stderr, "topopaper: SetParent failed (%lu); retrying\n", GetLastError());
@@ -289,7 +276,7 @@ static void build_views(void) {
             hw = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT,
                                  VIEW_CLASS, L"topopaper", WS_POPUP,
                                  v->rc.left, v->rc.top, v->w, v->h, NULL, NULL, inst, NULL);
-            if (hw) SetWindowPos(hw, below ? below : HWND_BOTTOM, 0, 0, 0, 0,
+            if (hw) SetWindowPos(hw, HWND_BOTTOM, 0, 0, 0, 0,
                                  SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
         }
         if (!hw) { fprintf(stderr, "topopaper: CreateWindow failed (%lu)\n", GetLastError()); continue; }
@@ -311,9 +298,9 @@ static void build_views(void) {
             engine_gl_init();
         }
         ShowWindow(hw, SW_SHOWNOACTIVATE);
-        fprintf(stderr, "topopaper: drawing on %s (%dx%d%s%s%s%s)\n", v->name, v->w, v->h,
+        fprintf(stderr, "topopaper: drawing on %s (%dx%d%s%s%s)\n", v->name, v->w, v->h,
                 desk ? (raised ? ", desktop layer 24H2" : ", desktop layer") : ", bottom window",
-                present_ulw ? ", ULW present" : present_gdi ? ", GDI present" : "", attach_mode[0] ? ", attach " : "", attach_mode);
+                attach_mode[0] ? ", attach " : "", attach_mode);
     }
     if (desk) dump_tree(FindWindowW(L"Progman", NULL), 0);
 }
@@ -383,45 +370,47 @@ static int all_covered(void) {
 }
 
 // ---- main loop ----------------------------------------------------------------------
-static void present_frame(struct view *v) {
-    size_t need = (size_t)v->w * v->h * 4;
-    if (need > gdi_cap) {
-        free(gdi_px);
-        gdi_px = malloc(need);
-        gdi_cap = gdi_px ? need : 0;
-        if (!gdi_px) return;
-    }
-    glPixelStorei(GL_PACK_ALIGNMENT, 4);
-    glReadPixels(0, 0, v->w, v->h, GL_BGRA, GL_UNSIGNED_BYTE, gdi_px);
-    BITMAPINFO bi;
-    memset(&bi, 0, sizeof bi);
-    bi.bmiHeader.biSize = sizeof bi.bmiHeader;
-    bi.bmiHeader.biWidth = v->w;
-    bi.bmiHeader.biHeight = v->h;            // bottom-up, like GL's rows
-    bi.bmiHeader.biPlanes = 1;
-    bi.bmiHeader.biBitCount = 32;
-    bi.bmiHeader.biCompression = BI_RGB;
-    if (!present_ulw) {
-        SetDIBitsToDevice(v->dc, 0, 0, v->w, v->h, 0, 0, 0, v->h, gdi_px, &bi, DIB_RGB_COLORS);
+// Is our frame what the screen shows? Compares a grid of points on the
+// primary monitor's work area that no app window covers; desktop icons
+// spoil a few, so most must match. Called with the frame just rendered (back
+// buffer), before the swap: the screen then still shows the frame before,
+// which differs by a fraction of a contour's drift.
+static void visibility_check(struct view *v) {
+    enum { G = 12 };
+    struct pt { int x, y; } pts[G * G];
+    int n = 0;
+    RECT w = v->work;
+    for (int j = 0; j < G; j++)
+        for (int i = 0; i < G; i++) {
+            POINT p = { w.left + (w.right - w.left) * (2 * i + 1) / (2 * G),
+                        w.top + (w.bottom - w.top) * (2 * j + 1) / (2 * G) };
+            HWND top = WindowFromPoint(p), root = top ? GetAncestor(top, GA_ROOT) : NULL;
+            if (root && counts(root)) continue;  // an app window is in the way
+            pts[n].x = p.x; pts[n].y = p.y; n++;
+        }
+    if (n < 16) {                            // the desktop is mostly covered: later
+        vis_check_at = ++vis_tries < 30 ? engine_now() + 10.0 : -1.0;
         return;
     }
-    void *bits = NULL;
-    HDC mem = CreateCompatibleDC(v->dc);
-    HBITMAP bmp = CreateDIBSection(mem, &bi, DIB_RGB_COLORS, &bits, NULL, 0);
-    if (bmp && bits) {
-        memcpy(bits, gdi_px, need);
-        HGDIOBJ old = SelectObject(mem, bmp);
-        SIZE sz = { v->w, v->h };
-        POINT src = { 0, 0 };
-        BLENDFUNCTION bf = { AC_SRC_OVER, 0, 255, 0 };
-        if (!UpdateLayeredWindow(v->hwnd, NULL, NULL, &sz, mem, &src, 0, &bf, ULW_OPAQUE)) {
-            static int warned = 0;
-            if (!warned++) fprintf(stderr, "topopaper: UpdateLayeredWindow failed (%lu)\n", GetLastError());
-        }
-        SelectObject(mem, old);
+    vis_check_at = -1.0;
+    HDC screen = GetDC(NULL);
+    int match = 0;
+    for (int k = 0; k < n; k++) {
+        unsigned char px[4];
+        glReadPixels(pts[k].x - v->rc.left, v->h - 1 - (pts[k].y - v->rc.top), 1, 1,
+                     GL_RGBA, GL_UNSIGNED_BYTE, px);
+        COLORREF c = GetPixel(screen, pts[k].x, pts[k].y);
+        if (c != CLR_INVALID && abs(GetRValue(c) - px[0]) < 40 &&
+            abs(GetGValue(c) - px[1]) < 40 && abs(GetBValue(c) - px[2]) < 40) match++;
     }
-    if (bmp) DeleteObject(bmp);
-    DeleteDC(mem);
+    ReleaseDC(NULL, screen);
+    fprintf(stderr, "topopaper: the desktop shows %d of %d sampled points of our frame\n", match, n);
+    if (match * 3 < n) {
+        fprintf(stderr, "topopaper: this desktop doesn't show its wallpaper layer's windows; "
+                        "drawing as a bottom window instead (it covers the desktop icons)\n");
+        no_desktop = 1;
+        rebuild = 1;
+    }
 }
 
 static void frame(void) {
@@ -438,8 +427,8 @@ static void frame(void) {
         int i = (prim + k) % n_views;       // primary first: it eases shared state
         if (!views[i].hwnd || !wglMakeCurrent(views[i].dc, glrc)) continue;
         engine_render(views[i].w, views[i].h, i == prim);
-        if (present_gdi) present_frame(&views[i]);
-        else SwapBuffers(views[i].dc);
+        if (i == prim && vis_check_at >= 0.0 && engine_now() >= vis_check_at) visibility_check(&views[i]);
+        SwapBuffers(views[i].dc);
     }
 }
 
@@ -500,7 +489,6 @@ int main(void) {
         }
     }
     destroy_views();
-    if (hidden_worker && IsWindow(hidden_worker)) ShowWindow(hidden_worker, SW_SHOWNA);
     if (glrc) wglDeleteContext(glrc);
     repaint_desktop();
     if (ctl) DestroyWindow(ctl);
