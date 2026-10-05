@@ -107,3 +107,25 @@ def test_cli_help_lists_commands(capsys):
 
 
 
+
+
+def test_explicit_flags_beat_tier_recipe(monkeypatch):
+    from topopaper.build import area
+    seen = {}
+
+    def stop(*a, **k):
+        raise SystemExit(0)
+    monkeypatch.setattr(area, "Progress", lambda name: seen.setdefault("p", None) or stop())
+    monkeypatch.setattr(area, "load_font_cmap", lambda: None)
+    import builtins
+    real_print = builtins.print
+    out = []
+    monkeypatch.setattr(builtins, "print", lambda *a, **k: out.append(" ".join(map(str, a))))
+    try:
+        area.main(["x", "--bbox", "0", "0", "1", "1", "--zoom", "6", "--tier", "2",
+                   "--features", "none", "--labels", "peaks"])
+    except SystemExit:
+        pass
+    builtins.print = real_print
+    line = next(o for o in out if "tier 2 recipe" in o)
+    assert "features=none" in line and "labels=peaks" in line

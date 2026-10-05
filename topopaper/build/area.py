@@ -1488,15 +1488,15 @@ def main(argv=None):
     # lines too early) and baked 17 bald packs. Apply first, derive after.
     if a.tier is not None and a.tier in TIERS:
         t = TIERS[a.tier]
-        d = ap.get_default
-        if "features" in t and a.features == d("features"): a.features = t["features"]
-        if "roads_classes" in t and a.roads_classes == d("roads_classes"):
-            a.roads_classes = t["roads_classes"]
-        if "labels" in t and a.labels == d("labels"): a.labels = t["labels"]
-        if "peak_min_ele" in t and a.peak_min_ele == d("peak_min_ele"):
-            a.peak_min_ele = t["peak_min_ele"]
-        if "peak_top" in t and a.peak_top == d("peak_top"): a.peak_top = t["peak_top"]
-        if "peak_sep" in t and a.peak_sep == d("peak_sep"): a.peak_sep = t["peak_sep"]
+        # flags the caller actually passed win — even when they equal the
+        # default (a connector rung's explicit `--features none` must not
+        # turn back into the tier's continent-wide border query)
+        given = {tok.split("=")[0].lstrip("-").replace("-", "_")
+                 for tok in argv if tok.startswith("--")}
+        for k in ("features", "roads_classes", "labels", "peak_min_ele",
+                  "peak_top", "peak_sep"):
+            if k in t and k not in given:
+                setattr(a, k, t[k])
         if not a.water and not a.water_from_dem:
             if t.get("water") == "dem": a.water_from_dem = True
             elif t.get("water") == "osm": a.water = True
