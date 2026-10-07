@@ -65,7 +65,7 @@ the engine flies there. The engine writes it too when it auto-roams.
 | `cond` | short condition text, e.g. `PARTLY CLOUDY` |
 | `news` | optional heads-up line, e.g. `FROST TONIGHT`; a leading `@` plus `neta` makes a live countdown (`@RAIN` → `RAIN IN 12 MIN`) |
 | `neta` | unix time the `@` event starts |
-| `apack`, `afrz` | pack name and its freezing level in metres (draws the snowline) |
+| `apack`, `afrz` | pack name and its freezing level in metres (draws the snowline while that pack is on screen at a regional zoom; never on the globe) |
 
 **location.json** — `{"tz": "Area/City", "utc_offset": seconds, ...}`; the
 clock follows `tz` (on Windows, whose C runtime has no IANA zones, `utc_offset`).

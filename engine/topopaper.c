@@ -184,6 +184,9 @@ static double chip_next = 0.0;              // context-chip resync (1s cadence)
 static double ph_aur = 0.0;                 // aurora curtain drift (integrated)
 static float  g_aurf = 0.0f;                // globe-scale factor for aurora/lights
 static float  g_snow = 99999.0f, g_snow_t = 99999.0f;  // snowline metres (eased)
+static float  g_snow_frz = 99999.0f;        // weather.txt snowline, metres
+static int    g_snow_pack = -1;             // ...and the pack it was measured for
+static float  g_snowf = 0.0f;               // regional-scale gate for the snowline
 static int    g_on_battery = 0;
 static int    g_covered = 0;
 static char   covered_path[512];
@@ -734,13 +737,14 @@ static void hud_wx_sync(double t) {
         }
         fclose(f);
     }
-    // snowline: the fetcher looked up the freezing level for the CURRENT pack;
-    // trust it only while we're still on that pack (roams outrun the 15-min
-    // refresh — better bare than wrongly white)
-    g_snow_t = 99999.0f;
-    if (afrz > 0 && apack[0] && p_cur >= 0 && !strcmp(apack, packs[p_cur].name)
-        && time(NULL) - ts < 7200)
-        g_snow_t = (float)afrz - 300.0f;
+    // snowline: the fetcher looked up the freezing level for one pack;
+    // step_world trusts it only while we're on that pack (roams outrun the
+    // 15-min refresh — better bare than wrongly white)
+    g_snow_pack = -1;
+    if (afrz > 0 && apack[0] && time(NULL) - ts < 7200)
+        for (int i = 0; i < n_packs; i++)
+            if (!strcmp(apack, packs[i].name)) { g_snow_pack = i; break; }
+    g_snow_frz = (float)afrz - 300.0f;
     g_wx_want = 0;
     if (ts && temp[0] && time(NULL) - ts < 7200) {
         char ns[40];
@@ -1482,7 +1486,7 @@ static const char *FRAG =
     "uniform vec2 uGlobeC;\n"                // view-centre lon,lat (radians)
     "uniform vec3 uSun;\n"                   // sun dir, view-centre ENU frame
     "uniform vec4 uSunH;\n"                  // hillshade light xyz + golden warmth
-    "uniform float uSnow;\n"                 // snowline metres ASL (99999 = off)
+    "uniform vec2 uSnow;\n"                  // snowline metres ASL (99999 = off), strength
     "uniform vec3 uAur;\n"                   // aurora: globe factor, drift phase, on
     // theme palette (engine/themes.h), pushed whenever the theme changes
     "uniform vec3 uBgLo, uBgHi, uLnLo, uLnHi, uWatC, uShoreC, uSnowC, uWarmC;\n"
@@ -1646,7 +1650,7 @@ static const char *FRAG =
     "  col=mix(col, uShoreC, shore*0.38);\n"
     // live snowline: whiten land above the real freezing level (true metres,
     // crawl removed); roads/labels draw after, so passes stay plowed
-    "  float sn=smoothstep(uSnow, uSnow+140.0, hm-uCrawlM)*land;\n"
+    "  float sn=smoothstep(uSnow.x, uSnow.x+140.0, hm-uCrawlM)*land*uSnow.y;\n"
     "  col=mix(col, uSnowC, sn*0.42);\n"
     "  float line=max(minor, major);\n"
     "  col=mix(col, uWarmC, line*uCpu*0.28);\n"
@@ -2264,7 +2268,13 @@ static void step_world(void) {
     g_cpu   += (cpu_target - g_cpu) * kc;
     float kn = 1.0f - expf((float)(-dt / 8.0));   // night: slow fade
     g_night += (night_target - g_night) * kn;
-    // snowline: ease WITHIN terrain range, but snap across the off-sentinel
+    // snowline: on only while the camera is on (and not leaving) the pack
+    // it was measured for. Checked every frame, not at the 30 s weather
+    // poll: a flight out to the globe used to carry one valley's freezing
+    // level over the planet (Tibet white, the poles bare).
+    g_snow_t = (g_snow_pack >= 0 && g_snow_pack == p_cur
+                && !(fly_active == 1 && fly_tgt != p_cur)) ? g_snow_frz : 99999.0f;
+    // ease WITHIN terrain range, but snap across the off-sentinel
     // (easing down from 99999 would spend ~40s above the summits — invisible)
     if (g_snow > 90000.0f && g_snow_t < 90000.0f) g_snow = g_snow_t + 1500.0f;
     if (g_snow_t > 90000.0f && g_snow > 12000.0f) g_snow = g_snow_t;
@@ -3076,7 +3086,13 @@ void engine_render(int w, int h, int primary) {
     glUniform2f(u_globec, (float)g_glon, (float)g_glat);
     glUniform3f(u_sun, (float)g_sunE, (float)g_sunN, (float)g_sunU);
     glUniform4f(u_sunh, g_sunh[0], g_sunh[1], g_sunh[2], g_sunh[3]);
-    glUniform1f(u_snow, g_snow);
+    // one freezing level only describes a region: full on views up to ~25°
+    // of ground tall, gone by ~50° (never on the globe)
+    {
+        double vdeg = cam_h * 360.0 * cos(g_glat);
+        g_snowf = 1.0f - (float)smooth01((vdeg - 25.0) / 25.0);
+    }
+    glUniform2f(u_snow, g_snow, g_snowf);
     double garr = g_radpx / (double)h;       // globe-scale gate for aurora/lights
     double gav = (2.0 - garr) / 1.3;
     g_aurf = (float)smooth01(gav < 0.0 ? 0.0 : (gav > 1.0 ? 1.0 : gav));
