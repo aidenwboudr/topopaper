@@ -80,6 +80,7 @@ To remove it: `./uninstall.sh` (keeps your maps and settings) or
 | **Go somewhere** | Super+Shift+B (Win+Shift+B on Windows; on macOS make one in the Shortcuts app), or `topopaper-ctl search` — pick a map or type any place |
 | **Fly to a map** | `topopaper-ctl fly zermatt` (no name: the next map) |
 | **Start / restart / stop** | `topopaper-ctl restart`, `topopaper-ctl stop` |
+| **Lock screen to match** | `topopaper-ctl snapshot lock.png` saves the wallpaper as it is now, without the clock (Linux); see below |
 | **Something wrong?** | `topopaper-ctl doctor` checks the install and your desktop |
 | **Everything else** | `topopaper-ctl --help` |
 
@@ -108,6 +109,19 @@ your compositor config yourself on Linux, run `topopaper-session` at startup:
 | niri | `spawn-at-startup "topopaper-session"` |
 | river / Wayfire / others | run `topopaper-session` from your autostart |
 | KDE Plasma | System Settings → Autostart → add `topopaper-session` |
+
+### A matching lock screen
+
+`topopaper-ctl snapshot OUT` (`.png`, `.jpg` or `.ppm`) saves the map on
+screen right now at your largest display's resolution. Point a lock screen at
+it so locking keeps the same view. For swaylock, bind this as your lock
+command (PPM is the quickest to write, so the lock doesn't lag):
+
+```sh
+topopaper-ctl snapshot "$XDG_RUNTIME_DIR/lock.ppm"; swaylock -f -i "$XDG_RUNTIME_DIR/lock.ppm"
+```
+
+hyprlock and gtklock take the same file as their background image.
 
 ## Privacy
 

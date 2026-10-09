@@ -45,6 +45,7 @@ On Linux and macOS (Windows: see [PLATFORMS.md](PLATFORMS.md)):
 | covered flag | `$XDG_RUNTIME_DIR/topopaper-covered` (`1`/`0`) |
 | build progress | `$XDG_RUNTIME_DIR/topopaper-progress.bin` |
 | build jobs | `$XDG_RUNTIME_DIR/topopaper-jobs/<slug>.json` |
+| snapshot | `$XDG_RUNTIME_DIR/topopaper-snapshot-request` → `topopaper-snapshot.ppm` |
 | shipped data | `$PREFIX/share/topopaper/` (`hud.bin`, `lights.bin`, `fonts/`) |
 
 `TOPOPAPER_DIR=<dir>` puts packs and state in one directory (handy for
@@ -73,6 +74,13 @@ clock follows `tz` (on Windows, whose C runtime has no IANA zones, `utc_offset`)
 **covered flag** — `1` while windows cover the wallpaper on every visible
 workspace, else `0`. Written by `topopaper.watch` (one backend per compositor).
 The Windows and macOS backends see occlusion themselves and ignore it.
+
+**snapshot** — `topopaper-ctl snapshot` creates the request file; the
+engine (polling it with the other cheap state) draws the world once more
+into the largest display's back buffer without the HUD, writes
+`topopaper-snapshot.ppm` (via a `.part` rename) and deletes the request. It
+draws outside the frame pacing, so it answers while windows cover the
+wallpaper. Only the Wayland backend answers for now.
 
 ## Area packs
 

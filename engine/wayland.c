@@ -61,18 +61,26 @@ static void render(struct output *o, int primary) {
     eglSwapBuffers(egl_display, o->egl_surface);
 }
 
-// One frame tick: step the world ONCE, then draw it into every output whose
-// previous frame the compositor has released. Returns 0 (nothing done) when
-// no output is ready, so the world stays put while nothing can show it.
-static int frame_tick(void) {
-    struct output *first = NULL, *prim = NULL;
+// The output with the most pixels (NULL: none can draw): the world step and
+// snapshots use its geometry.
+static struct output *largest_output(void) {
+    struct output *prim = NULL;
     long best = -1;
     for (struct output *o = outputs; o; o = o->next) {
         if (!o->configured || o->egl_surface == EGL_NO_SURFACE) continue;
         long px = (long)o->width * o->scale * (long)o->height * o->scale;
         if (px > best) { best = px; prim = o; }
-        if (!o->frame_cb && !first) first = o;
     }
+    return prim;
+}
+
+// One frame tick: step the world ONCE, then draw it into every output whose
+// previous frame the compositor has released. Returns 0 (nothing done) when
+// no output is ready, so the world stays put while nothing can show it.
+static int frame_tick(void) {
+    struct output *first = NULL, *prim = largest_output();
+    for (struct output *o = outputs; o; o = o->next)
+        if (o->configured && o->egl_surface != EGL_NO_SURFACE && !o->frame_cb) { first = o; break; }
     if (!first) return 0;
     if (!eglMakeCurrent(egl_display, first->egl_surface, first->egl_surface, egl_context))
         return 0;
@@ -81,6 +89,16 @@ static int frame_tick(void) {
         if (o->configured && o->egl_surface != EGL_NO_SURFACE && !o->frame_cb)
             render(o, o == prim || (prim->frame_cb && o == first));
     return 1;
+}
+
+// A snapshot request: draw into the largest output's surface right away, frame
+// callback or not (a covered wallpaper may not get one for a long time).
+static void snapshot(void) {
+    struct output *prim = largest_output();
+    if (prim && eglMakeCurrent(egl_display, prim->egl_surface, prim->egl_surface, egl_context))
+        engine_snapshot(prim->width * prim->scale, prim->height * prim->scale);
+    else
+        engine_snapshot(0, 0);               // nothing on screen: drop the request
 }
 
 // ---- outputs: surfaces, hotplug ----------------------------------------------
@@ -287,6 +305,7 @@ int main(void) {
             if (frame_tick()) next_tick = engine_next_frame();
             else stalled = 1;                // every output busy: wait for a callback
         }
+        if (engine_snapshot_due()) snapshot();
         while (wl_display_prepare_read(display) != 0)
             if (wl_display_dispatch_pending(display) < 0) { err = 1; break; }
         if (err) break;

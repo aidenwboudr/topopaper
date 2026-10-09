@@ -114,6 +114,8 @@ double engine_now(void);                    // seconds since engine_setup()
 double engine_next_frame(void);             // engine_now() the next frame is due at
 void   engine_step(int w, int h);           // advance the world once (largest view, px)
 void   engine_render(int w, int h, int primary);   // draw into the current surface
+int    engine_snapshot_due(void);           // `topopaper-ctl snapshot` is waiting
+void   engine_snapshot(int w, int h);       // answer it into the current surface (px)
 
 // ---- OS services (compat.c) ---------------------------------------------------
 double mono_sec(void);                      // monotonic seconds

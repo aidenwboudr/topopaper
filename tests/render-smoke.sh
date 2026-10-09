@@ -36,3 +36,23 @@ sd = ImageStat.Stat(im).stddev[0]
 print(f"{sys.argv[1]}: luminance stddev {sd:.1f}")
 sys.exit(0 if sd > 4.0 else "frame looks blank")
 EOF
+
+# `topopaper-ctl snapshot`: the engine answers with the display's frame minus
+# the HUD, also while a fullscreen window covers it (no frame callbacks then)
+snap() {
+    PYTHONPATH="$ROOT" python3 -m topopaper.cli snapshot "$1"
+    python3 - "$1" <<'EOF'
+import sys
+from PIL import Image, ImageStat
+im = Image.open(sys.argv[1])
+sd = ImageStat.Stat(im.convert("L")).stddev[0]
+print(f"{sys.argv[1]}: {im.size[0]}x{im.size[1]}, luminance stddev {sd:.1f}")
+sys.exit(0 if im.size == (1280, 800) and sd > 4.0 else "bad snapshot")
+EOF
+}
+snap "$OUT/snapshot.png"
+if command -v foot >/dev/null; then
+    SWAYSOCK=$(ls "$XDG_RUNTIME_DIR"/sway-ipc.*.sock) swaymsg -q 'exec foot -F'
+    sleep 2
+    snap "$OUT/snapshot-covered.png"
+fi

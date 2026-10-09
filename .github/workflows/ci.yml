@@ -65,7 +65,7 @@ jobs:
       options: --cap-add SYS_NICE
     steps:
       - name: Dependencies
-        run: pacman -Syu --noconfirm --needed base-devel git pkgconf wayland mesa sway grim python python-numpy python-pillow
+        run: pacman -Syu --noconfirm --needed base-devel git pkgconf wayland mesa sway grim foot python python-numpy python-pillow
       - uses: actions/checkout@v5
       - name: Build
         run: make
