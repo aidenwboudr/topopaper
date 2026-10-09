@@ -6,7 +6,7 @@ Installed layout on Linux and macOS (XDG):
     $XDG_DATA_HOME/topopaper/     area packs (areas/), user-built lights.bin, venv
     $XDG_STATE_HOME/topopaper/    the `area` file (which pack is on screen)
     $XDG_CACHE_HOME/topopaper/    tile caches, weather.txt, location.json
-    $XDG_RUNTIME_DIR              covered flag, build progress, session lock
+    $XDG_RUNTIME_DIR              covered flag, build progress, session lock, snapshots
                                   (macOS without it: ~/Library/Caches/topopaper/run)
 
 On Windows:
@@ -115,6 +115,14 @@ def covered_file() -> Path:
 
 def progress_file() -> Path:
     return runtime_dir() / "topopaper-progress.bin"
+
+
+def snapshot_request_file() -> Path:
+    return runtime_dir() / "topopaper-snapshot-request"
+
+
+def snapshot_file() -> Path:
+    return runtime_dir() / "topopaper-snapshot.ppm"
 
 
 def default_weather_file() -> Path:

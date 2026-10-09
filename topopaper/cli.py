@@ -1,9 +1,12 @@
 """topopaper-ctl: one entry point for everything outside the engine."""
 import importlib
 import json
+import os
 import shutil
 import subprocess
 import sys
+import time
+from pathlib import Path
 
 from . import __version__, config, paths, system, util
 
@@ -14,6 +17,7 @@ COMMANDS = {
     "search":      ("topopaper.search", "main", "pick or type a place (launcher menu)"),
     "status":      ("topopaper.cli", "cmd_status", "show paths, packs and what is running"),
     "config":      ("topopaper.cli", "cmd_config", "get/set settings: config [KEY [VALUE]]"),
+    "snapshot":    ("topopaper.cli", "cmd_snapshot", "save the wallpaper as it is now to an image"),
     "settings":    ("topopaper.cli", "cmd_settings", "open the settings window"),
     "session":     ("topopaper.session", "main", "run the wallpaper + helpers (autostart this)"),
     "restart":     ("topopaper.session", "restart", "restart the running wallpaper"),
@@ -71,6 +75,64 @@ def cmd_status(argv):
     else:
         for k, v in info.items():
             print(f"{k:15} {v}")
+    return 0
+
+
+SNAPSHOT_FORMATS = {".png": "PNG", ".jpg": "JPEG", ".jpeg": "JPEG", ".ppm": "PPM"}
+SNAPSHOT_HELP = """usage: topopaper-ctl snapshot OUT.png|OUT.jpg|OUT.ppm
+
+Saves the wallpaper as it looks right now, at the largest display's
+resolution and without the clock, e.g. for a lock screen:
+
+    topopaper-ctl snapshot "$XDG_RUNTIME_DIR/lock.ppm" && swaylock -i "$XDG_RUNTIME_DIR/lock.ppm"
+
+PPM is the fastest to write. Needs the running wallpaper (Linux)."""
+
+
+def cmd_snapshot(argv):
+    if not argv or argv[0] in ("-h", "--help"):
+        print(SNAPSHOT_HELP)
+        return 0 if argv else 2
+    out = Path(argv[0]).expanduser()
+    fmt = SNAPSHOT_FORMATS.get(out.suffix.lower())
+    if not fmt:
+        print("snapshot: OUT must end in .png, .jpg or .ppm", file=sys.stderr)
+        return 2
+    if not system.LINUX:
+        print("snapshot: only the Linux (Wayland) wallpaper answers snapshots so far",
+              file=sys.stderr)
+        return 1
+    if not system.engine_running():
+        print("snapshot: the wallpaper isn't running", file=sys.stderr)
+        return 1
+    req, frame = paths.snapshot_request_file(), paths.snapshot_file()
+    frame.unlink(missing_ok=True)
+    req.touch()
+    # the engine looks every 0.4 s and answers within a frame
+    deadline = time.monotonic() + 5.0
+    while not frame.exists():
+        if time.monotonic() > deadline:
+            req.unlink(missing_ok=True)
+            print("snapshot: the wallpaper did not answer", file=sys.stderr)
+            return 1
+        time.sleep(0.03)
+    # written beside OUT and renamed into place: a lock screen or greeter
+    # reading OUT never sees half an image
+    part = out.with_name(out.name + ".part")
+    try:
+        if fmt == "PPM":
+            shutil.copyfile(frame, part)
+        else:
+            from PIL import Image
+            with Image.open(frame) as im:
+                im.save(part, fmt, **({"quality": 92} if fmt == "JPEG" else {}))
+        os.replace(part, out)
+    except OSError as e:
+        part.unlink(missing_ok=True)
+        print(f"snapshot: {e}", file=sys.stderr)
+        return 1
+    finally:
+        frame.unlink(missing_ok=True)
     return 0
 
 

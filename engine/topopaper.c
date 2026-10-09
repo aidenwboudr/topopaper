@@ -206,6 +206,17 @@ static char  area_seen[64] = "";            // last area-file word acted on
 // Present + fresh -> fade a label-styled quad in bottom-left; the builder
 // heartbeats mtime through long network backoffs and unlinks when done.
 static char   progress_path[512];
+
+// ---- snapshot: one still of the wallpaper, on request -----------------------
+// `topopaper-ctl snapshot` creates <run>/topopaper-snapshot-request; the
+// backend sees engine_snapshot_due() and calls engine_snapshot() with a GL
+// context current, outside the frame pacing, so it answers even while the
+// compositor withholds frames from a covered wallpaper. The frame lands in
+// <run>/topopaper-snapshot.ppm without the HUD (a still would keep the clock
+// frozen at the wrong minute); lock screens and login greeters show it.
+static char   snap_req_path[512], snap_out_path[512];
+static int    g_snap_req = 0;
+static int    g_snap_drawing = 0;           // engine_render: skip HUD + meter
 static GLuint g_prog_tex = 0;
 static int    g_prog_w = 0, g_prog_h = 0;
 static double g_prog_mseen = 0.0;
@@ -1407,6 +1418,7 @@ static void update_targets(double now) {
     } else {
         g_covered = 0;                       // no watcher: never assume covered
     }
+    g_snap_req = path_exists(snap_req_path);
     double pm = path_mtime(progress_path);  // download meter presence + updates
     if (pm >= 0.0 && difftime(time(NULL), (time_t)pm) < 45.0) {
         double m = floor(pm);
@@ -2997,6 +3009,30 @@ static void label_pass_begin(void) {
     glVertexAttribPointer(la_pos, 2, GL_FLOAT, GL_FALSE, 0, 0);
 }
 
+// Write the current framebuffer's bottom-left w x h as a binary PPM (buffers
+// kept between calls: TOPA_REC writes one per frame).
+static int write_frame_ppm(const char *path, int w, int h) {
+    static unsigned char *px = NULL, *row = NULL;
+    static size_t cap = 0;
+    if ((size_t)w * h * 4 > cap) {
+        cap = (size_t)w * h * 4;
+        px = realloc(px, cap);
+        row = realloc(row, (size_t)w * 3);
+    }
+    if (!px || !row) { cap = 0; return 0; }
+    FILE *f = fopen(path, "wb");
+    if (!f) return 0;
+    glPixelStorei(GL_PACK_ALIGNMENT, 1);
+    glReadPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, px);
+    fprintf(f, "P6\n%d %d\n255\n", w, h);
+    for (int y = h - 1; y >= 0; y--) {
+        const unsigned char *s = px + (size_t)y * w * 4;
+        for (int x = 0; x < w; x++) memcpy(row + x * 3, s + x * 4, 3);
+        fwrite(row, 1, (size_t)w * 3, f);
+    }
+    return fclose(f) == 0;
+}
+
 // TOPA_SHOT=<file.ppm>: write the primary display's frame once TOPA_SHOT_T
 // seconds have passed, then quit (CI renders on every platform with it).
 static void maybe_shot(int w, int h) {
@@ -3008,44 +3044,16 @@ static void maybe_shot(int w, int h) {
         due = t ? atof(t) : 8.0;
     }
     if (now_sec() < due || !g_running) return;
-    unsigned char *px = malloc((size_t)w * h * 4);
-    FILE *f = px ? fopen(path, "wb") : NULL;
-    if (f) {
-        glPixelStorei(GL_PACK_ALIGNMENT, 1);
-        glReadPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, px);
-        fprintf(f, "P6\n%d %d\n255\n", w, h);
-        for (int y = h - 1; y >= 0; y--)
-            for (int x = 0; x < w; x++) fwrite(px + ((size_t)y * w + x) * 4, 1, 3, f);
-        fclose(f);
+    if (write_frame_ppm(path, w, h))
         fprintf(stderr, "topopaper: wrote %s (%dx%d)\n", path, w, h);
-    }
-    free(px);
     g_running = 0;
 }
 
 // TOPA_REC: write this frame (see g_rec)
 static void rec_capture(int w, int h, const char *name) {
-    static unsigned char *px = NULL, *row = NULL;
-    static size_t cap = 0;
-    if ((size_t)w * h * 4 > cap) {
-        cap = (size_t)w * h * 4;
-        px = realloc(px, cap);
-        row = realloc(row, (size_t)w * 3);
-    }
-    if (!px || !row) return;
     char path[480];
     snprintf(path, sizeof path, "%s/%s.ppm", rec_dir, name);
-    FILE *f = fopen(path, "wb");
-    if (!f) return;
-    glPixelStorei(GL_PACK_ALIGNMENT, 1);
-    glReadPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, px);
-    fprintf(f, "P6\n%d %d\n255\n", w, h);
-    for (int y = h - 1; y >= 0; y--) {
-        const unsigned char *s = px + (size_t)y * w * 4;
-        for (int x = 0; x < w; x++) memcpy(row + x * 3, s + x * 4, 3);
-        fwrite(row, 1, (size_t)w * 3, f);
-    }
-    fclose(f);
+    write_frame_ppm(path, w, h);
 }
 
 // TOPA_REC: start each listed flight once the camera has idled rec_hold
@@ -3153,7 +3161,7 @@ void engine_render(int w, int h, int primary) {
             fclose(pf);
         }
     }
-    if (g_prog_a > 0.01f && g_prog_tex) {
+    if (g_prog_a > 0.01f && g_prog_tex && !g_snap_drawing) {
         label_pass_begin();
         glActiveTexture(GL_TEXTURE1);
         glBindTexture(GL_TEXTURE_2D, g_prog_tex);
@@ -3210,7 +3218,7 @@ void engine_render(int w, int h, int primary) {
 
     // ---- HUD clock (screen-anchored, right-centre) -------------------------
     struct hudline L[4];
-    int nl = hud_lines(L);
+    int nl = g_snap_drawing ? 0 : hud_lines(L);
     if (nl) {
         label_pass_begin();
         glActiveTexture(GL_TEXTURE1);
@@ -3270,6 +3278,26 @@ static double frame_min_dt(void) {
 double engine_now(void) { return now_sec(); }
 double engine_next_frame(void) { return g_rec ? now_sec() : t_prev + frame_min_dt(); }
 int    engine_layer_background(void) { return cfg.layer_background; }
+int    engine_snapshot_due(void) { return g_snap_req; }
+
+// Answer a snapshot request: draw the world as it stands into the current
+// surface's back buffer (never swapped; the next frame paints over it), read
+// it back and publish it with a rename, so readers never see half a file.
+void engine_snapshot(int w, int h) {
+    g_snap_req = 0;
+    remove(snap_req_path);
+    if (w <= 0 || h <= 0) return;
+    g_snap_drawing = 1;
+    engine_render(w, h, 0);
+    g_snap_drawing = 0;
+    char part[540];
+    snprintf(part, sizeof part, "%s.part", snap_out_path);
+    if (write_frame_ppm(part, w, h)) {
+        remove(snap_out_path);               // rename() won't replace on Windows
+        if (rename(part, snap_out_path) == 0)
+            fprintf(stderr, "topopaper: snapshot %dx%d\n", w, h);
+    }
+}
 
 void engine_poll(void) {
     if (g_hup) { g_hup = 0; cfg_poll(1); }
@@ -3377,6 +3405,8 @@ static void resolve_paths(void) {
         snprintf(lights_path, sizeof lights_path, "%s/lights.bin", share);
     snprintf(covered_path, sizeof covered_path, "%s/topopaper-covered", run);
     snprintf(progress_path, sizeof progress_path, "%s/topopaper-progress.bin", run);
+    snprintf(snap_req_path, sizeof snap_req_path, "%s/topopaper-snapshot-request", run);
+    snprintf(snap_out_path, sizeof snap_out_path, "%s/topopaper-snapshot.ppm", run);
     make_dirs(state);
 }
 
