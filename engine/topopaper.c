@@ -151,7 +151,7 @@ static GLint u_dbg = -1, u_hs = -1, u_fg = -1, u_fin = -1, u_sib = -1;
 static float g_fg[4] = {1.0f, 0.0f, 0.0f, 0.0f};   // feature gates per slot
 static float g_fin[16];                             // [i*4+j]: slot j finer than i
 static float g_sib[16];                             // [i*4+j]: slots i, j share a scale
-static GLint u_radpx, u_globec, u_wrap, u_sun, u_sunh, u_snow, u_aur;
+static GLint u_radpx, u_globec, u_wrap, u_sun, u_sunh, u_snow, u_aur, u_sunx;
 // city lights (lights.bin: world cities for the globe's night side)
 #define MAXLTS 8192
 static float  lt_lat[MAXLTS], lt_lon[MAXLTS], lt_w[MAXLTS];
@@ -1500,6 +1500,7 @@ static const char *FRAG =
     "uniform vec4 uSunH;\n"                  // hillshade light xyz + golden warmth
     "uniform vec2 uSnow;\n"                  // snowline metres ASL (99999 = off), strength
     "uniform vec3 uAur;\n"                   // aurora: globe factor, drift phase, on
+    "uniform vec3 uSunX;\n"                  // sun dir, earth-fixed (x 0E, z north)
     // theme palette (engine/themes.h), pushed whenever the theme changes
     "uniform vec3 uBgLo, uBgHi, uLnLo, uLnHi, uWatC, uShoreC, uSnowC, uWarmC;\n"
     "uniform vec3 uRimC, uIceC, uAurA, uAurB;\n"
@@ -1672,6 +1673,16 @@ static const char *FRAG =
     "  fa=vec2((1.0-smoothstep(fpL.x, fpL.y, dL))*fpL.z,\n"
     "          (1.0-smoothstep(fpA.x, fpA.y, dA))*fpA.z);\n"
     "  return col; }\n"
+    // ---- aurora noise -----------------------------------------------------
+    // value noise whose x lattice wraps every n cells, so a pattern laid
+    // around the auroral oval has no seam
+    "float aHash(vec2 p){ vec3 p3=fract(vec3(p.xyx)*0.1031);\n"
+    "  p3+=dot(p3, p3.yzx+33.33); return fract((p3.x+p3.y)*p3.z); }\n"
+    "float aNoise(vec2 p, float n){\n"
+    "  vec2 i=floor(p); vec2 f=fract(p); vec2 u=f*f*(3.0-2.0*f);\n"
+    "  float x0=mod(i.x, n), x1=mod(i.x+1.0, n);\n"
+    "  return mix(mix(aHash(vec2(x0,i.y)), aHash(vec2(x1,i.y)), u.x),\n"
+    "             mix(aHash(vec2(x0,i.y+1.0)), aHash(vec2(x1,i.y+1.0)), u.x), u.y); }\n"
     "void main(){\n"
     "  vec2 suv=gl_FragCoord.xy/uRes.xy;\n"
     "  vec3 bg=mix(uBgLo, uBgHi, suv.y);\n"
@@ -1805,23 +1816,79 @@ static const char *FRAG =
     "      float flo=0.90+0.10*sin(fo*38.0+sin(fl*57.0)*3.0)*sin(fl*71.0+fo*7.0);\n"
     "      terr=mix(terr, (terr*0.75+uIceC)*icd*flo, pcp*0.85);\n"
     "      float cn=cos(fl);\n"
-    "      float gdN= snl*0.9869+cn*0.1610*cos(fo+1.2688);\n"
-    "      float gdS=-snl*0.9869+cn*0.1610*cos(fo-1.8728);\n"
-    // thin auroral crown (a fat scalloped donut didn't read as
-    // aurora): narrow ~3deg arc at 20deg geomagnetic colatitude + a faint
-    // equatorward drape broken into filament rays (three incommensurate
-    // waves, sharpened); green core, mauve only on the poleward fringe
-    "      float clt=acos(clamp(max(gdN,gdS),-1.0,1.0));\n"
-    "      float dc=(clt-0.349)/0.0524;\n"
-    "      float core=exp(-dc*dc*2.2);\n"
-    "      float drape=exp(-max(dc,0.0)*0.9)*0.35*smoothstep(-0.3, 0.4, dc);\n"
-    "      float rw=sin(fo*29.0+uAur.y)*sin(fo*47.0-uAur.y*1.3)\n"
-    "              *sin(fo*11.0+uAur.y*0.55);\n"
-    "      float rays=0.35+0.65*smoothstep(-0.2, 0.75, rw);\n"
+    // aurora after the satellite views (DE-1/IMAGE/SMILE of the whole oval,
+    // VIIRS night passes of its arcs), not a ring: the oval sits off the
+    // geomagnetic pole, ~14deg out at noon and ~22deg at midnight, thin and
+    // faint on the day side and wide on the night side, with a substorm
+    // bulge before midnight. Inside it, a soft equatorward glow under a few
+    // folded discrete arcs, a ragged poleward edge, patchy brightness and
+    // fine streaks along the arcs. Everything rides magnetic local time
+    // (angle from the sun around the dipole), so the oval stays put under
+    // the sun while the earth turns beneath it. Phase factors are
+    // multiples of 0.1 so the 20pi wrap of uAur.y never jumps; tr advances
+    // one whole loop of the oval per wrap.
+    "      vec3 ep=vec3(cn*cos(fo), cn*sin(fo), snl);\n"
+    "      vec3 mN=vec3(0.0479, -0.1537, 0.9869);\n"      // 80.7N 72.7W dipole
+    "      float gd=dot(ep, mN); float hs=gd<0.0?-1.0:1.0;\n"
+    "      vec3 mg=mN*hs;\n"
+    "      vec3 e1=uSunX-dot(uSunX, mg)*mg;\n"
+    "      e1=e1/max(length(e1), 1e-4); vec3 e2=cross(mg, e1);\n"
+    // am: angle from magnetic midnight, + toward dusk in both hemispheres
+    "      float am=atan(-dot(ep, e2)*hs, -dot(ep, e1));\n"
+    "      float clt=acos(clamp(abs(gd), -1.0, 1.0));\n"
+    "      float nm=0.5+0.5*cos(am);\n"                    // 1 midnight, 0 noon
+    "      float ph=uAur.y;\n"
+    "      float ax=am*0.15915+0.5;\n"                     // 0..1 round the oval
+    "      float sw=sin(ph*0.1), cw=cos(ph*0.1);\n"
+    "      float tr=ph*0.0159155;\n"                      // ph*0.1/2pi
+    "      float big=aNoise(vec2(ax*7.0, 3.1+sw*0.8), 7.0);\n"
+    "      float bm=am-0.42;\n"                            // bulge centre ~22.4 MLT
+    "      float bul=exp(-bm*bm*4.5)*(0.55+0.45*sin(ph*0.1+1.3));\n"
+    "      float c0=0.245+0.135*nm+0.022*(big-0.5)-0.045*bul;\n"
+    "      float w=0.018+0.034*nm*nm+0.028*bul;\n"
+    "      float dc=(clt-c0)/w;\n"                          // <0 poleward
     "      float nfl=1.0-smoothstep(-0.12, 0.10, sdot);\n"
-    "      aurA=(core*(0.75+0.25*rays)+drape*rays)*nfl*uAur.x*uAur.z*lm*0.50;\n"
-    "      aurC=mix(uAurA, uAurB,\n"
-    "               smoothstep(0.0,-1.5,dc));\n"
+    "      if(dc>-3.0 && dc<4.5 && nfl>0.0){\n"
+    // pixel footprint in radians: fine structure fades out before it aliases
+    "        float pxr=1.0/(uRadPx*max(zz, 0.12));\n"
+    "        float wx=(ax+tr)*24.0;\n"                   // slow westward travel
+    "        float wrp=aNoise(vec2(wx, 7.0+cw*0.7), 24.0)-0.5;\n"
+    "        wrp+=0.22*(aNoise(vec2((ax-2.0*tr)*64.0, 2.0+sw), 64.0)-0.5);\n"
+    "        float dw=dc+wrp*1.6;\n"                       // folds and omega bands
+    "        float pole=smoothstep(-1.65, -0.85, dw);\n"   // ragged poleward edge
+    "        float diff=pole*exp(-max(dc-0.1, 0.0)*1.1)*smoothstep(-1.4, 0.2, dc);\n"
+    // three discrete arcs, each wandering across the poleward half of the
+    // band on its own and fading in and out along its length; never
+    // thinner than ~1.3 px (wider arcs keep their energy, so a small globe
+    // gets a soft band instead of shimmer)
+    "        float arcs=0.0;\n"
+    "        for(int k=0;k<3;k++){\n"
+    "          float fk=float(k);\n"
+    "          float n=13.0+7.0*fk;\n"
+    "          float wan=aNoise(vec2((ax+tr*(1.0+fk))*n, 11.0+fk*7.0+cw*0.5), n);\n"
+    "          float pos=-1.2+0.55*fk+1.1*(wan-0.5);\n"
+    "          float th0=0.09+0.07*fk;\n"
+    "          float th=max(th0, 1.3*pxr/w);\n"
+    "          float d=(dw-pos)/th;\n"
+    "          float lane=aNoise(vec2((ax-tr*fk)*(29.0+6.0*fk), 3.0+fk*5.0), 29.0+6.0*fk);\n"
+    "          arcs+=exp(-d*d)*th0/th*smoothstep(0.2, 0.7, lane)*(1.0-0.25*fk);\n"
+    "        }\n"
+    "        arcs*=pole;\n"
+    // streaks run along the arcs (long round the oval, thin across it)
+    "        float stf=smoothstep(1.5, 4.0, w/(6.0*pxr));\n"
+    "        float st=aNoise(vec2((ax+tr)*48.0, (dc+dw)*3.0), 48.0);\n"
+    "        float strk=mix(1.0, 0.6+0.8*st, stf);\n"
+    "        float pat=aNoise(vec2((ax-tr)*11.0, 9.0+sw*0.6), 11.0);\n"
+    "        pat=0.40+0.95*pat*pat;\n"                     // knots and lulls
+    "        float lev=(0.30+0.70*nm*nm+0.8*bul)*pat;\n"
+    "        float g=(diff*0.45+arcs*0.85)*strk*lev;\n"
+    // the high red/violet: a faint diffuse haze poleward of the arcs and
+    // across the day side, never a stroke along the edge
+    "        float rh=smoothstep(-2.8, -1.3, dc)*(1.0-smoothstep(-1.3, -0.3, dc))*0.20*lev;\n"
+    "        float dy=0.6*(1.0-nm);\n"
+    "        aurA=(g+rh)*nfl*uAur.x*uAur.z*lm*0.95;\n"
+    "        aurC=mix(uAurA, uAurB, clamp((rh+g*dy)/max(g+rh, 1e-4), 0.0, 1.0));\n"
+    "      }\n"
     "    }\n"
     "    col=mix(space, terr, lm);\n"
     "    onp=lm;\n"
@@ -1945,6 +2012,7 @@ void engine_gl_init(void) {
     u_sunh    = glGetUniformLocation(prog, "uSunH");
     u_snow    = glGetUniformLocation(prog, "uSnow");
     u_aur     = glGetUniformLocation(prog, "uAur");
+    u_sunx    = glGetUniformLocation(prog, "uSunX");
     u_wrap    = glGetUniformLocation(prog, "uWrap");
     static const char *thn[12] = { "uBgLo", "uBgHi", "uLnLo", "uLnHi", "uWatC",
         "uShoreC", "uSnowC", "uWarmC", "uRimC", "uIceC", "uAurA", "uAurB" };
@@ -3105,6 +3173,8 @@ void engine_render(int w, int h, int primary) {
     double gav = (2.0 - garr) / 1.3;
     g_aurf = (float)smooth01(gav < 0.0 ? 0.0 : (gav > 1.0 ? 1.0 : gav));
     glUniform3f(u_aur, g_aurf, (float)ph_aur, cfg.aurora ? 1.0f : 0.0f);
+    glUniform3f(u_sunx, (float)(cos(g_sdec) * cos(g_sslon)),
+                (float)(cos(g_sdec) * sin(g_sslon)), (float)sin(g_sdec));
     float wrap[4];
     for (int i = 0; i < 4; i++)
         wrap[i] = (s_slotpk[i] >= 0 && packs[s_slotpk[i]].msx > 0.999) ? 1.0f : 0.0f;
